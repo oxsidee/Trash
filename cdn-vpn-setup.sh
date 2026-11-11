@@ -3,6 +3,7 @@
 # Запуск: bash cdn-vpn-setup.sh          — полная настройка нового сервера (под root, Ubuntu/Debian)
 #         bash cdn-vpn-setup.sh lock     — пустить на 443 только Yandex CDN
 #         bash cdn-vpn-setup.sh unlock   — снять это ограничение
+#         bash cdn-vpn-setup.sh panel-proxy — открыть панель только для внешнего reverse proxy (например, Nginx Proxy Manager)
 # Ответы и прогресс сохраняются в /root/.cdn-vpn.env — скрипт можно прервать и запустить снова.
 
 set -u
@@ -430,9 +431,13 @@ install_lock() {
   mkdir -p /etc/cdn-lock
   cat > /usr/local/sbin/cdn-lock.sh <<'EOF'
 #!/usr/bin/env bash
-# 443/tcp — только с подсетей Yandex CDN (официальный список), 2096 (подписки 3x-ui) — закрыт.
+# 443/tcp — только с подсетей Yandex CDN (официальный список), 2096 (подписки 3x-ui) — закрыт,
+# 2053 (панель) — только с IP из /etc/cdn-lock/panel-allow.txt.
 # SSH и 80 (продление Let's Encrypt) не трогаются. Отключить: nft delete table inet cdnlock
 CACHE=/etc/cdn-lock/prefixes.txt
+ALLOW=/etc/cdn-lock/panel-allow.txt
+PANEL_ACCEPT=""
+[ -s "$ALLOW" ] && PANEL_ACCEPT="tcp dport 2053 ip saddr { $(paste -sd, "$ALLOW") } accept"
 tmp=$(mktemp)
 if curl -fsS --max-time 20 https://tech.cdn.yandex.net/prefixes/yc.json \
    | python3 -c 'import json,sys,ipaddress;[print(p) for p in json.load(sys.stdin)["prefixes"] if ipaddress.ip_network(p,strict=False).version==4]' > "$tmp" \
@@ -452,7 +457,8 @@ table inet cdnlock {
     iif lo accept
     ct state established,related accept
     tcp dport 443 ip saddr @yc accept
-    tcp dport { 443, 2096 } drop
+    $PANEL_ACCEPT
+    tcp dport { 443, 2053, 2096 } drop
     udp dport 443 drop
   }
 }
@@ -502,6 +508,36 @@ step_unlock() {
   ok "Ограничение снято: порты 80/443 открыты для всех. Включить снова: bash $0 lock"
 }
 
+step_panel_proxy() {
+  local ip path crt="/etc/letsencrypt/live/${BASE_DOMAIN}" conf="/etc/letsencrypt/renewal/${BASE_DOMAIN}.conf"
+  [[ -f "$crt/fullchain.pem" ]] || { err "Нет сертификата $crt — сначала выполни полную настройку"; return 1; }
+  say "Панель будет слушать порт $PANEL_PORT по HTTPS, доступ — только с IP сервера, где стоит reverse proxy."
+  while true; do
+    ask ip "Публичный IPv4 сервера с Nginx Proxy Manager" "$(head -n1 /etc/cdn-lock/panel-allow.txt 2>/dev/null)"
+    [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] && break
+    err "Некорректный IPv4: '$ip'"
+  done
+  mkdir -p /etc/cdn-lock; echo "$ip" > /etc/cdn-lock/panel-allow.txt
+
+  /usr/local/x-ui/x-ui setting -listenIP 0.0.0.0 -webCert "$crt/fullchain.pem" -webCertKey "$crt/privkey.pem" >/dev/null || return 1
+  if [[ -f "$conf" ]]; then
+    sed -i '/^renew_hook/d' "$conf"
+    echo 'renew_hook = systemctl reload nginx; systemctl restart x-ui' >> "$conf"
+  fi
+  systemctl restart x-ui
+  install_lock || return 1
+
+  path=$(awk '/^URL:/{print $2}' $PANEL_TXT 2>/dev/null | sed -E 's#https://[^/]+/([^/]+)/?#\1#')
+  ok "Порт $PANEL_PORT открыт только для $ip"
+  say "\nВ Nginx Proxy Manager → Hosts → Proxy Hosts → Add Proxy Host:"
+  say "  Details:  Domain Names = ${c_b}<домен панели, например 3x-ui.iscreation.space>${c_0}"
+  say "            Scheme = ${c_b}https${c_0},  Forward Hostname / IP = ${c_b}${SERVER_IP}${c_0},  Forward Port = ${c_b}${PANEL_PORT}${c_0}"
+  say "            Websockets Support = вкл,  Block Common Exploits = вкл"
+  say "  SSL:      SSL Certificate = Request a new SSL Certificate,  Force SSL = вкл,  HTTP/2 Support = вкл"
+  say "  DNS домена панели: A-запись → IP сервера с Nginx Proxy Manager ($ip)"
+  say "\nПанель откроется по адресу: https://<домен панели>/${path:-<путь_панели>}/"
+}
+
 panel_tunnel_hint() {
   local path; path=$(awk '/^URL:/{print $2}' $PANEL_TXT 2>/dev/null | sed -E 's#https://[^/]+/([^/]+)/?#\1#')
   say "Панель (через SSH-туннель) — на своём компьютере выполни:"
@@ -534,6 +570,14 @@ export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
 command -v dig >/dev/null || { apt-get update -qq && apt-get install -y -qq dnsutils >/dev/null; }
 
 [[ -f "$STATE" ]] && . "$STATE"
+
+if [[ "${1:-}" == panel-proxy ]]; then
+  ask_domain BASE_DOMAIN "Основной домен (на него выпущен сертификат на этом сервере)" "${BASE_DOMAIN:-}"; save BASE_DOMAIN
+  [[ -n "${SERVER_IP:-}" ]] || { SERVER_IP=$(curl -4 -fsS --max-time 10 https://ifconfig.me); save SERVER_IP; }
+  hdr 14 "Панель через внешний reverse proxy"
+  step_panel_proxy
+  exit
+fi
 
 if [[ "${1:-}" == unlock ]]; then
   hdr 12 "Снятие ограничения доступа"
