@@ -198,12 +198,15 @@ step_nginx() {
 log_format xhttp '$remote_addr "$request_method $uri" status=$status up=$upstream_status rt=$request_time urt=$upstream_response_time hlen=$request_length';
 EOF
 
+  local http_root="return 301 https://\$host\$request_uri;"
+  nft list table inet cdnlock >/dev/null 2>&1 && http_root="return 444;"
+
   cat > /etc/nginx/sites-available/default <<EOF
 server {
     listen 80 default_server;
     server_name _;
     location /.well-known/acme-challenge/ { root /var/www/html; }
-    location / { return 301 https://\$host\$request_uri; }
+    location / { $http_root }
 }
 
 server {
@@ -411,6 +414,80 @@ EOF
   fi
 }
 
+install_lock() {
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nftables curl python3 >/dev/null || return 1
+  mkdir -p /etc/cdn-lock
+  cat > /usr/local/sbin/cdn-lock.sh <<'EOF'
+#!/usr/bin/env bash
+# 443/tcp — только с подсетей Yandex CDN (официальный список), 2096 (подписки 3x-ui) — закрыт.
+# SSH и 80 (продление Let's Encrypt) не трогаются. Отключить: nft delete table inet cdnlock
+CACHE=/etc/cdn-lock/prefixes.txt
+tmp=$(mktemp)
+if curl -fsS --max-time 20 https://tech.cdn.yandex.net/prefixes/yc.json \
+   | python3 -c 'import json,sys,ipaddress;[print(p) for p in json.load(sys.stdin)["prefixes"] if ipaddress.ip_network(p,strict=False).version==4]' > "$tmp" \
+   && [ "$(wc -l < "$tmp")" -gt 10 ]; then
+  mv "$tmp" "$CACHE"
+else
+  rm -f "$tmp"
+fi
+[ -s "$CACHE" ] || { echo "cdn-lock: нет списка подсетей Yandex CDN" >&2; exit 1; }
+nft -f - <<NFT
+table inet cdnlock
+delete table inet cdnlock
+table inet cdnlock {
+  set yc { type ipv4_addr; flags interval; auto-merge; elements = { $(paste -sd, "$CACHE") } }
+  chain input {
+    type filter hook input priority -10; policy accept;
+    iif lo accept
+    ct state established,related accept
+    tcp dport 443 ip saddr @yc accept
+    tcp dport { 443, 2096 } drop
+    udp dport 443 drop
+  }
+}
+NFT
+EOF
+  chmod 755 /usr/local/sbin/cdn-lock.sh
+  cat > /etc/cron.d/cdn-lock <<'EOF'
+@reboot root sleep 20; /usr/local/sbin/cdn-lock.sh
+17 4 * * * root /usr/local/sbin/cdn-lock.sh
+EOF
+
+  if grep -q 'return 301 https://\$host\$request_uri;' /etc/nginx/sites-available/default; then
+    sed -i 's#location / { return 301 https://\$host\$request_uri; }#location / { return 444; }#' /etc/nginx/sites-available/default
+    nginx -t && systemctl reload nginx
+  fi
+
+  /usr/local/sbin/cdn-lock.sh || return 1
+  ok "Порт 443 открыт только для Yandex CDN ($(wc -l < /etc/cdn-lock/prefixes.txt) подсетей), список обновляется ежедневно"
+}
+
+step_lock() {
+  say "Закроем сервер от всех, кроме узлов Yandex CDN:"
+  say "  • 443 — только с подсетей Yandex CDN (сайт и туннель работают через $CDN_DOMAIN);"
+  say "  • 80 — только для продления сертификата, остальное соединение сбрасывается;"
+  say "  • SSH не трогается."
+  say "После этого ${BASE_DOMAIN} и ${PANEL_DOMAIN} напрямую открываться не будут: сайт — через https://$CDN_DOMAIN, панель — через SSH-туннель."
+  yes_no "Включить?" y || { warn "Пропущено. Включить позже: bash $0 lock"; return 0; }
+  install_lock || return 1
+  sleep 3
+  local code; code=$(curl -s -o /dev/null --max-time 20 -w '%{http_code}' "https://$CDN_DOMAIN/")
+  if [[ "$code" == 200 ]]; then ok "https://$CDN_DOMAIN/ по-прежнему отвечает 200"
+  else
+    err "https://$CDN_DOMAIN/ ответил $code"
+    if yes_no "Откатить блокировку?" y; then
+      nft delete table inet cdnlock; rm -f /etc/cron.d/cdn-lock; warn "Блокировка снята"; return 1
+    fi
+  fi
+}
+
+panel_tunnel_hint() {
+  local path; path=$(awk '/^URL:/{print $2}' $PANEL_TXT 2>/dev/null | sed -E 's#https://[^/]+/([^/]+)/?#\1#')
+  say "Панель (через SSH-туннель) — на своём компьютере выполни:"
+  say "  ${c_b}ssh -L 8443:127.0.0.1:$PANEL_PORT root@$SERVER_IP${c_0}"
+  say "  и, не закрывая его, открой в браузере ${c_b}http://localhost:8443/${path:-<путь_панели>}/${c_0}"
+}
+
 step_finish() {
   say "${c_g}Готово.${c_0}\n"
   todo "Подключи телефон: Happ / v2RayTun / v2rayNG / v2rayN (последней версии) → импорт ссылки из панели."
@@ -419,7 +496,9 @@ step_finish() {
   say  "\nПроверка с телефона (мобильный интернет, без другого VPN):"
   say  "  1) https://$CDN_DOMAIN должен открыть сайт;"
   say  "  2) при подключении в  tail -f /var/log/nginx/xhttp.log  появляются строки GET $XHTTP_PATH/... status=200."
-  say  "\nПанель: $(awk '/^URL:/{print $2}' $PANEL_TXT)   (доступы: $PANEL_TXT)"
+  if nft list table inet cdnlock >/dev/null 2>&1; then echo; panel_tunnel_hint; say "Доступы: $PANEL_TXT"
+  else say  "\nПанель: $(awk '/^URL:/{print $2}' $PANEL_TXT)   (доступы: $PANEL_TXT)"
+  fi
   say  "Логи:   journalctl -u x-ui -f   |   tail -f /var/log/nginx/error.log"
   [[ "$SITE_MODE" == 2 ]] && say "Обновить сайт: запусти этот скрипт и повтори шаг 6 (или: cd /opt/site && git pull && docker compose up -d --build)"
   say  "\nПереезд на новый сервер: запусти этот скрипт там, затем поменяй A-записи $BASE_DOMAIN и $PANEL_DOMAIN на новый IP."
@@ -433,6 +512,17 @@ command -v apt-get >/dev/null || { err "Нужна Ubuntu/Debian"; exit 1; }
 command -v dig >/dev/null || { apt-get update -qq && apt-get install -y -qq dnsutils >/dev/null; }
 
 [[ -f "$STATE" ]] && . "$STATE"
+
+if [[ "${1:-}" == lock ]]; then
+  [[ -n "${CDN_DOMAIN:-}" ]] || { ask CDN_DOMAIN "Домен CDN" "cdn.example.ru"; save CDN_DOMAIN; }
+  [[ -n "${BASE_DOMAIN:-}" ]] || { ask BASE_DOMAIN "Основной домен" "${CDN_DOMAIN#*.}"; save BASE_DOMAIN; }
+  [[ -n "${PANEL_DOMAIN:-}" ]] || { PANEL_DOMAIN="panel.$BASE_DOMAIN"; save PANEL_DOMAIN; }
+  [[ -n "${SERVER_IP:-}" ]] || { SERVER_IP=$(curl -4 -fsS --max-time 10 https://ifconfig.me); save SERVER_IP; }
+  hdr 12 "Доступ только для Yandex CDN"
+  step_lock && done_step 12 && { echo; panel_tunnel_hint; }
+  exit
+fi
+
 if [[ -f "$STATE" ]] && yes_no "Найдена предыдущая настройка ($STATE). Начать заново с нуля?" n; then
   rm -f "$STATE"; unset $(compgen -v | grep "^STEP_")
 fi
@@ -451,4 +541,5 @@ run_step 8  "Установка 3x-ui"                  step_xui
 run_step 9  "Настройка панели"                 step_panel_gui
 run_step 10 "Yandex Cloud CDN и CNAME"         step_cdn
 run_step 11 "Проверка туннеля"                 step_selftest
-hdr 12 "Итог"; step_finish
+run_step 12 "Доступ только для Yandex CDN"     step_lock
+hdr 13 "Итог"; step_finish
