@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # VLESS + XHTTP через Yandex Cloud CDN: nginx + certbot + 3x-ui (+ сайт на главной).
-# Запуск: bash cdn-vpn-setup.sh   (под root, Ubuntu/Debian)
+# Запуск: bash cdn-vpn-setup.sh          — полная настройка нового сервера (под root, Ubuntu/Debian)
+#         bash cdn-vpn-setup.sh lock     — пустить на 443 только Yandex CDN
+#         bash cdn-vpn-setup.sh unlock   — снять это ограничение
 # Ответы и прогресс сохраняются в /root/.cdn-vpn.env — скрипт можно прервать и запустить снова.
 
 set -u
@@ -21,8 +23,17 @@ todo() { echo -e "${c_y}▶ СДЕЛАЙ:${c_0} $*"; }
 
 ask() { # ask VAR "вопрос" "по умолчанию"
   local __v="$1" __q="$2" __d="${3:-}" __a
-  if [[ -n "$__d" ]]; then read -r -p "$__q [$__d]: " __a </dev/tty; else read -r -p "$__q: " __a </dev/tty; fi
+  if [[ -n "$__d" ]]; then read -e -r -p "$__q [$__d]: " __a </dev/tty; else read -e -r -p "$__q: " __a </dev/tty; fi
+  __a="${__a//[[:space:]]/}"
   printf -v "$__v" '%s' "${__a:-$__d}"
+}
+ask_domain() { # ask_domain VAR "вопрос" "по умолчанию" — только латиница, цифры, точки и дефисы
+  while true; do
+    ask "$@"
+    [[ "${!1}" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]] && return 0
+    err "Некорректный домен: '${!1}'. Только латиница, цифры, точки и дефисы (проверь раскладку)."
+    printf -v "$1" '%s' ""
+  done
 }
 yes_no() { # yes_no "вопрос" y|n
   local a d="${2:-y}"
@@ -55,10 +66,10 @@ resolve_chain() { dig +short "$1" @1.1.1.1 2>/dev/null | tr '\n' ' '; }
 # ---------------------------------------------------------------- шаги
 
 step_params() {
-  ask BASE_DOMAIN  "Основной домен (на нём будет сайт и источник для CDN)" "${BASE_DOMAIN:-}"
+  ask_domain BASE_DOMAIN  "Основной домен (на нём будет сайт и источник для CDN)" "${BASE_DOMAIN:-}"
   [[ -z "$BASE_DOMAIN" ]] && { err "Домен обязателен"; return 1; }
-  ask PANEL_DOMAIN "Поддомен для панели 3x-ui" "${PANEL_DOMAIN:-panel.$BASE_DOMAIN}"
-  ask CDN_DOMAIN   "Поддомен для CDN (к нему подключаются клиенты)" "${CDN_DOMAIN:-cdn.$BASE_DOMAIN}"
+  ask_domain PANEL_DOMAIN "Поддомен для панели 3x-ui" "${PANEL_DOMAIN:-panel.$BASE_DOMAIN}"
+  ask_domain CDN_DOMAIN   "Поддомен для CDN (к нему подключаются клиенты)" "${CDN_DOMAIN:-cdn.$BASE_DOMAIN}"
   ask XHTTP_PATH   "Путь туннеля" "${XHTTP_PATH:-/media/hls/live}"
   [[ "$XHTTP_PATH" != /* ]] && XHTTP_PATH="/$XHTTP_PATH"
 
@@ -469,16 +480,26 @@ step_lock() {
   say "  • SSH не трогается."
   say "После этого ${BASE_DOMAIN} и ${PANEL_DOMAIN} напрямую открываться не будут: сайт — через https://$CDN_DOMAIN, панель — через SSH-туннель."
   yes_no "Включить?" y || { warn "Пропущено. Включить позже: bash $0 lock"; return 0; }
+  say "Снять ограничение в любой момент: ${c_b}bash $0 unlock${c_0}"
   install_lock || return 1
   sleep 3
   local code; code=$(curl -s -o /dev/null --max-time 20 -w '%{http_code}' "https://$CDN_DOMAIN/")
   if [[ "$code" == 200 ]]; then ok "https://$CDN_DOMAIN/ по-прежнему отвечает 200"
   else
     err "https://$CDN_DOMAIN/ ответил $code"
-    if yes_no "Откатить блокировку?" y; then
-      nft delete table inet cdnlock; rm -f /etc/cron.d/cdn-lock; warn "Блокировка снята"; return 1
-    fi
+    yes_no "Откатить блокировку?" y && { step_unlock; return 1; }
   fi
+}
+
+step_unlock() {
+  nft delete table inet cdnlock 2>/dev/null
+  rm -f /etc/cron.d/cdn-lock
+  if grep -q 'location / { return 444; }' /etc/nginx/sites-available/default 2>/dev/null; then
+    sed -i 's#location / { return 444; }#location / { return 301 https://$host$request_uri; }#' /etc/nginx/sites-available/default
+    nginx -t && systemctl reload nginx
+  fi
+  eval "STEP_12=0"; save STEP_12
+  ok "Ограничение снято: порты 80/443 открыты для всех. Включить снова: bash $0 lock"
 }
 
 panel_tunnel_hint() {
@@ -509,13 +530,20 @@ step_finish() {
 
 [[ $EUID -eq 0 ]] || { err "Запусти от root"; exit 1; }
 command -v apt-get >/dev/null || { err "Нужна Ubuntu/Debian"; exit 1; }
+export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
 command -v dig >/dev/null || { apt-get update -qq && apt-get install -y -qq dnsutils >/dev/null; }
 
 [[ -f "$STATE" ]] && . "$STATE"
 
+if [[ "${1:-}" == unlock ]]; then
+  hdr 12 "Снятие ограничения доступа"
+  step_unlock
+  exit
+fi
+
 if [[ "${1:-}" == lock ]]; then
-  [[ -n "${CDN_DOMAIN:-}" ]] || { ask CDN_DOMAIN "Домен CDN" "cdn.example.ru"; save CDN_DOMAIN; }
-  [[ -n "${BASE_DOMAIN:-}" ]] || { ask BASE_DOMAIN "Основной домен" "${CDN_DOMAIN#*.}"; save BASE_DOMAIN; }
+  ask_domain CDN_DOMAIN "Домен CDN" "${CDN_DOMAIN:-cdn.example.ru}"; save CDN_DOMAIN
+  ask_domain BASE_DOMAIN "Основной домен" "${BASE_DOMAIN:-${CDN_DOMAIN#*.}}"; save BASE_DOMAIN
   [[ -n "${PANEL_DOMAIN:-}" ]] || { PANEL_DOMAIN="panel.$BASE_DOMAIN"; save PANEL_DOMAIN; }
   [[ -n "${SERVER_IP:-}" ]] || { SERVER_IP=$(curl -4 -fsS --max-time 10 https://ifconfig.me); save SERVER_IP; }
   hdr 12 "Доступ только для Yandex CDN"
