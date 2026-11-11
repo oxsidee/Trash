@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # VLESS + XHTTP через Yandex Cloud CDN: nginx + certbot + 3x-ui (+ сайт на главной).
 # Запуск: bash cdn-vpn-setup.sh          — полная настройка нового сервера (под root, Ubuntu/Debian)
-#         bash cdn-vpn-setup.sh lock     — пустить на 443 только Yandex CDN
+#         bash cdn-vpn-setup.sh lock     — пустить на 443 только Yandex CDN (сайт по прямому адресу не открывается)
+#         bash cdn-vpn-setup.sh open-site — 443 открыт всем (обычный сайт), туннель отвечает только Yandex CDN
 #         bash cdn-vpn-setup.sh unlock   — снять это ограничение
 #         bash cdn-vpn-setup.sh panel-proxy — открыть панель только для внешнего reverse proxy (например, Nginx Proxy Manager)
 # Ответы и прогресс сохраняются в /root/.cdn-vpn.env — скрипт можно прервать и запустить снова.
@@ -206,6 +207,7 @@ step_nginx() {
     h2_listen=" http2"; h2_line=""
   fi
 
+  ensure_geo
   cat > /etc/nginx/conf.d/xhttp-log.conf <<'EOF'
 log_format xhttp '$remote_addr "$request_method $uri" status=$status up=$upstream_status rt=$request_time urt=$upstream_response_time hlen=$request_length';
 EOF
@@ -234,6 +236,7 @@ $h2_line
     keepalive_requests 100000;
 
     location $XHTTP_PATH {
+        if (\$from_yc_cdn = 0) { return 404; }
         proxy_pass http://127.0.0.1:$XRAY_PORT;
         proxy_http_version 1.1;
         proxy_set_header Host \$host;
@@ -426,15 +429,30 @@ EOF
   fi
 }
 
+ensure_geo() {
+  [[ -f /etc/nginx/conf.d/cdn-geo.conf ]] || echo 'geo $from_yc_cdn { default 1; }' > /etc/nginx/conf.d/cdn-geo.conf
+}
+
+guard_tunnel() { # туннель отвечает только адресам из geo $from_yc_cdn
+  local path="$1" f=/etc/nginx/sites-available/default
+  grep -q 'from_yc_cdn' "$f" && return 0
+  sed -i "\#location $path {#a\        if (\$from_yc_cdn = 0) { return 404; }" "$f"
+  grep -q 'from_yc_cdn' "$f" || { err "Не нашёл в $f блок location $path"; return 1; }
+}
+
 install_lock() {
   DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nftables curl python3 >/dev/null || return 1
   mkdir -p /etc/cdn-lock
   cat > /usr/local/sbin/cdn-lock.sh <<'EOF'
 #!/usr/bin/env bash
-# 443/tcp — только с подсетей Yandex CDN (официальный список), 2096 (подписки 3x-ui) — закрыт,
-# 2053 (панель) — только с IP из /etc/cdn-lock/panel-allow.txt.
+# 443/tcp — только с подсетей Yandex CDN (официальный список; если есть /etc/cdn-lock/open-443 — открыт всем),
+# 2096 (подписки 3x-ui) — закрыт, 2053 (панель) — только с IP из /etc/cdn-lock/panel-allow.txt.
+# Список подсетей также пишется в nginx (geo $from_yc_cdn) — туннель отвечает только Yandex CDN.
 # SSH и 80 (продление Let's Encrypt) не трогаются. Отключить: nft delete table inet cdnlock
 CACHE=/etc/cdn-lock/prefixes.txt
+GEO=/etc/nginx/conf.d/cdn-geo.conf
+DROP_PORTS="443, 2053, 2096"
+[ -f /etc/cdn-lock/open-443 ] && DROP_PORTS="2053, 2096"
 ALLOW=/etc/cdn-lock/panel-allow.txt
 PANEL_ACCEPT=""
 [ -s "$ALLOW" ] && PANEL_ACCEPT="tcp dport 2053 ip saddr { $(paste -sd, "$ALLOW") } accept"
@@ -447,6 +465,11 @@ else
   rm -f "$tmp"
 fi
 [ -s "$CACHE" ] || { echo "cdn-lock: нет списка подсетей Yandex CDN" >&2; exit 1; }
+geo_new=$(mktemp)
+{ echo 'geo $from_yc_cdn {'; echo '    default 0;'; sed 's/.*/    & 1;/' "$CACHE"; echo '}'; } > "$geo_new"
+if cmp -s "$geo_new" "$GEO"; then rm -f "$geo_new"
+else mv "$geo_new" "$GEO"; chmod 644 "$GEO"; nginx -t -q && systemctl reload nginx
+fi
 nft -f - <<NFT
 table inet cdnlock
 delete table inet cdnlock
@@ -458,7 +481,7 @@ table inet cdnlock {
     ct state established,related accept
     tcp dport 443 ip saddr @yc accept
     $PANEL_ACCEPT
-    tcp dport { 443, 2053, 2096 } drop
+    tcp dport { $DROP_PORTS } drop
     udp dport 443 drop
   }
 }
@@ -470,16 +493,28 @@ EOF
 17 4 * * * root /usr/local/sbin/cdn-lock.sh
 EOF
 
-  if grep -q 'return 301 https://\$host\$request_uri;' /etc/nginx/sites-available/default; then
+  if [[ -f /etc/cdn-lock/open-443 ]]; then
+    sed -i 's#location / { return 444; }#location / { return 301 https://$host$request_uri; }#' /etc/nginx/sites-available/default
+  else
     sed -i 's#location / { return 301 https://\$host\$request_uri; }#location / { return 444; }#' /etc/nginx/sites-available/default
-    nginx -t && systemctl reload nginx
   fi
+  nginx -t -q && systemctl reload nginx
 
   /usr/local/sbin/cdn-lock.sh || return 1
-  ok "Порт 443 открыт только для Yandex CDN ($(wc -l < /etc/cdn-lock/prefixes.txt) подсетей), список обновляется ежедневно"
+  if [[ -f /etc/cdn-lock/open-443 ]]; then
+    ok "443 открыт всем, туннель отвечает только Yandex CDN ($(wc -l < /etc/cdn-lock/prefixes.txt) подсетей), список обновляется ежедневно"
+  else
+    ok "Порт 443 открыт только для Yandex CDN ($(wc -l < /etc/cdn-lock/prefixes.txt) подсетей), список обновляется ежедневно"
+  fi
 }
 
 step_lock() {
+  say "Как открыт сервер для остальных:"
+  say "  1) Обычный сайт: ${BASE_DOMAIN} открывается в браузере, туннель отвечает только узлам Yandex CDN (остальным — 404)."
+  say "  2) Полностью закрыт: 443 только для Yandex CDN, ${BASE_DOMAIN} напрямую не открывается."
+  local mode; ask mode "Выбор" "1"
+  if [[ "$mode" == 1 ]]; then step_open_site; return; fi
+  rm -f /etc/cdn-lock/open-443
   say "Закроем сервер от всех, кроме узлов Yandex CDN:"
   say "  • 443 — только с подсетей Yandex CDN (сайт и туннель работают через $CDN_DOMAIN);"
   say "  • 80 — только для продления сертификата, остальное соединение сбрасывается;"
@@ -497,9 +532,36 @@ step_lock() {
   fi
 }
 
+step_open_site() {
+  ask XHTTP_PATH "Путь туннеля" "${XHTTP_PATH:-/media/hls/live}"; save XHTTP_PATH
+  say "Сайт ${BASE_DOMAIN} будет открываться всем, путь ${XHTTP_PATH} — отвечать только узлам Yandex CDN (остальным 404)."
+  say "Порты панели (2053) и подписок (2096) снаружи закрыты. SSH не трогается."
+  ensure_geo
+  guard_tunnel "$XHTTP_PATH" || return 1
+  if [[ -L /etc/nginx/sites-enabled/panel ]]; then
+    rm -f /etc/nginx/sites-enabled/panel
+    warn "Отключён вход в панель через ${PANEL_DOMAIN:-panel-домен} на этом сервере (панель — через SSH-туннель или panel-proxy)"
+  fi
+  mkdir -p /etc/cdn-lock; touch /etc/cdn-lock/open-443
+  install_lock || return 1
+  sleep 2
+  local site tun cdn
+  site=$(curl -s -o /dev/null --max-time 15 -w '%{http_code}' "https://$BASE_DOMAIN/")
+  tun=$(curl -s -o /dev/null --max-time 15 -w '%{http_code}' "https://$BASE_DOMAIN$XHTTP_PATH/test")
+  cdn=$(curl -s -o /dev/null --max-time 20 -w '%{http_code}' "https://${CDN_DOMAIN}$XHTTP_PATH/test")
+  say "  сайт напрямую: $site (ожидается 200)   туннель напрямую: $tun (ожидается 404)   туннель через CDN: $cdn (ожидается 400)"
+  if [[ "$site" == 200 && "$tun" == 404 && "$cdn" == 400 ]]; then ok "Всё как надо"
+  else
+    warn "Ответы отличаются от ожидаемых"
+    yes_no "Откатить?" y && { step_unlock; return 1; }
+  fi
+  say "Снять ограничения: ${c_b}bash $0 unlock${c_0}"
+}
+
 step_unlock() {
   nft delete table inet cdnlock 2>/dev/null
-  rm -f /etc/cron.d/cdn-lock
+  rm -f /etc/cron.d/cdn-lock /etc/cdn-lock/open-443
+  echo 'geo $from_yc_cdn { default 1; }' > /etc/nginx/conf.d/cdn-geo.conf
   if grep -q 'location / { return 444; }' /etc/nginx/sites-available/default 2>/dev/null; then
     sed -i 's#location / { return 444; }#location / { return 301 https://$host$request_uri; }#' /etc/nginx/sites-available/default
     nginx -t && systemctl reload nginx
@@ -579,6 +641,14 @@ if [[ "${1:-}" == panel-proxy ]]; then
   exit
 fi
 
+if [[ "${1:-}" == open-site ]]; then
+  ask_domain BASE_DOMAIN "Основной домен (указывает на этот сервер)" "${BASE_DOMAIN:-}"; save BASE_DOMAIN
+  ask_domain CDN_DOMAIN "Домен CDN" "${CDN_DOMAIN:-cdn.$BASE_DOMAIN}"; save CDN_DOMAIN
+  hdr 12 "Обычный сайт, туннель только для Yandex CDN"
+  step_open_site && done_step 12
+  exit
+fi
+
 if [[ "${1:-}" == unlock ]]; then
   hdr 12 "Снятие ограничения доступа"
   step_unlock
@@ -591,7 +661,10 @@ if [[ "${1:-}" == lock ]]; then
   [[ -n "${PANEL_DOMAIN:-}" ]] || { PANEL_DOMAIN="panel.$BASE_DOMAIN"; save PANEL_DOMAIN; }
   [[ -n "${SERVER_IP:-}" ]] || { SERVER_IP=$(curl -4 -fsS --max-time 10 https://ifconfig.me); save SERVER_IP; }
   hdr 12 "Доступ только для Yandex CDN"
-  step_lock && done_step 12 && { echo; panel_tunnel_hint; }
+  rm -f /etc/cdn-lock/open-443
+  say "Закроем сервер от всех, кроме узлов Yandex CDN (443), SSH не трогается."
+  yes_no "Включить?" y || exit 0
+  install_lock && done_step 12 && { echo; panel_tunnel_hint; }
   exit
 fi
 
