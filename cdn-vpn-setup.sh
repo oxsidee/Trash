@@ -176,7 +176,6 @@ step_cert() {
   pause
   # certbot сам печатает имя/значение и ждёт Enter на tty
   certbot certonly --manual --preferred-challenges dns \
-    --manual-public-ip-logging-ok \
     --cert-name "$CDN_DOMAIN" -d "$CDN_DOMAIN" \
     --agree-tos --register-unsafely-without-email \
     --deploy-hook "systemctl reload nginx" </dev/tty \
