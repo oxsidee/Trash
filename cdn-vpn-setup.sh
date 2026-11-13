@@ -65,7 +65,18 @@ resolve_chain() { dig +short "$1" @1.1.1.1 2>/dev/null | tr '\n' ' '; }
 local_https() { # local_https PATH — запрос к nginx этого сервера по CDN-домену, минуя CDN
   curl -s -o /dev/null --max-time 15 -w '%{http_code}' --resolve "$CDN_DOMAIN:443:127.0.0.1" "https://$CDN_DOMAIN$1"
 }
-panel_path() { awk '/^URL:/{print $2}' $PANEL_TXT 2>/dev/null | sed -E 's#https?://[^/]+/([^/]+)/?#\1#'; }
+xui_base_path() { # путь панели без слэшей: из x-ui или из panel.txt
+  local p
+  p=$(/usr/local/x-ui/x-ui setting -show true 2>/dev/null | sed -nE 's/.*webBasePath:[[:space:]]*//p' | head -n1 | tr -d '\r')
+  p="${p#/}"; p="${p%/}"
+  if [[ -z "$p" || "$p" == *://* ]]; then
+    p=$(awk '/^URL:/{print $2}' $PANEL_TXT 2>/dev/null | sed -E 's#https?://[^/]+/?##; s#/.*##')
+    p="${p#/}"; p="${p%/}"
+  fi
+  [[ "$p" == *://* ]] && p=""
+  printf '%s' "$p"
+}
+panel_path() { xui_base_path; }
 
 # ---------------------------------------------------------------- шаги
 
@@ -350,7 +361,7 @@ step_xui() {
     /usr/local/x-ui/x-ui setting -listenIP 127.0.0.1 -port $PANEL_PORT >/dev/null 2>&1
     /usr/local/x-ui/x-ui cert -reset >/dev/null 2>&1
     systemctl restart x-ui; sleep 5
-    path=$(/usr/local/x-ui/x-ui setting -show true 2>/dev/null | sed -nE 's#.*webBasePath: */?([^/ ]*)/?.*#\1#p' | head -n1)
+    path=$(xui_base_path)
     printf "URL:   http://localhost:8443/%s/\nLogin: (из бэкапа)\nPass:  (из бэкапа)\n" "$path" > $PANEL_TXT
     XUI_RESTORED=1; save XUI_RESTORED
     ok "Настройки 3x-ui восстановлены из $bk (логин, пароль, подключения и клиенты — как на старом сервере)"
@@ -361,14 +372,22 @@ step_xui() {
     out=$(/usr/local/x-ui/x-ui setting -listenIP 127.0.0.1 -port $PANEL_PORT -username "$u" -password "$p" -webBasePath "$path" -resetTwoFactor 2>&1)
     /usr/local/x-ui/x-ui cert -reset >/dev/null 2>&1
     systemctl restart x-ui; sleep 5
-    printf "URL:   http://localhost:8443/%s/\nLogin: %s\nPass:  %s\n" "$path" "$u" "$p" > $PANEL_TXT
-    XUI_RESTORED=0; save XUI_RESTORED
     if echo "$out" | grep -q "Username and password updated successfully"; then ok "Логин и пароль панели применены"
     else warn "Логин/пароль могли не примениться:"; echo "$out"; say "Если войти не получится — запусти скрипт и повтори этот шаг."
     fi
+    XUI_RESTORED=0; save XUI_RESTORED
   fi
   chmod 600 $PANEL_TXT
   systemctl is-active --quiet x-ui && ok "x-ui запущен" || { err "x-ui не запущен: journalctl -u x-ui -n 50"; return 1; }
+  path=$(xui_base_path)
+  if [[ "${XUI_RESTORED:-0}" == 1 ]]; then
+    printf "URL:   http://localhost:8443/%s/\nLogin: (из бэкапа)\nPass:  (из бэкапа)\n" "$path" > $PANEL_TXT
+  else
+    printf "URL:   http://localhost:8443/%s/\nLogin: %s\nPass:  %s\n" "$path" "$u" "$p" > $PANEL_TXT
+  fi
+  local code; code=$(curl -s -o /dev/null --max-time 5 -w '%{http_code}' "http://127.0.0.1:$PANEL_PORT/${path}/")
+  [[ "$code" == 200 || "$code" == 302 || "$code" == 401 ]] && ok "Панель отвечает на 127.0.0.1:$PANEL_PORT/${path}/ (код $code)" \
+    || warn "Панель на 127.0.0.1:$PANEL_PORT/${path}/ ответила $code — смотри: /usr/local/x-ui/x-ui setting -show true"
   say "\n${c_b}Панель 3x-ui${c_0} (слушает только 127.0.0.1, снаружи закрыта):"; cat $PANEL_TXT
   panel_tunnel_hint
 }
