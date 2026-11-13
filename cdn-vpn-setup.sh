@@ -875,11 +875,14 @@ step_panel_proxy() {
   /usr/local/x-ui/x-ui setting -listenIP 0.0.0.0 -port $PANEL_PORT \
     -webCert "$crt/fullchain.pem" -webCertKey "$crt/privkey.pem" >/dev/null || return 1
 
-  # публичный URI подписок без :2096 — клиенты ходят на NPM:443, location шлёт на VPS:2096
-  sub_uri="https://${panel_dom}"
-  xui_set_setting subURI "$sub_uri" || warn "Не записал subURI в БД — выставь вручную в панели: $sub_uri"
+  # subURI в 3x-ui = база + subPath + «/»; к ней только дописывается subId
+  # (если указать голый https://domain — получится https://domainSUBID без слэша и без path)
+  path=$(panel_path)
+  subp=$(xui_sub_path)
+  [[ -n "$subp" ]] || subp="sub"
+  sub_uri="https://${panel_dom}/${subp}/"
+  xui_set_setting subURI "$sub_uri" || warn "Не записал subURI — выставь вручную: $sub_uri"
   xui_set_setting subDomain "$panel_dom" || true
-  # пустой Host-check сбрасывать не будем: Domain = panel_dom совпадает с Host от NPM
 
   if [[ -f "$conf" ]]; then
     sed -i '/^renew_hook/d' "$conf"
@@ -889,10 +892,6 @@ step_panel_proxy() {
 
   # IP в allow + nft (иначе NPM получит 504: порты дропаются до accept)
   ensure_panel_allow "$ip" || return 1
-
-  path=$(panel_path)
-  subp=$(xui_sub_path)
-  [[ -n "$subp" ]] || subp="sub"
 
   code=$(curl -sk -o /dev/null --max-time 8 -w '%{http_code}' "https://127.0.0.1:$PANEL_PORT/${path}/")
   [[ "$code" == 200 || "$code" == 302 || "$code" == 401 ]] \
