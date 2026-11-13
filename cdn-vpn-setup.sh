@@ -13,8 +13,6 @@ STATE=/root/.cdn-vpn.env
 PANEL_TXT=/root/panel.txt
 XRAY_PORT=8080
 PANEL_PORT=2053
-PROBE=/var/www/html/.well-known/acme-challenge/cdn-probe
-
 c_g=$'\e[32m'; c_y=$'\e[33m'; c_r=$'\e[31m'; c_b=$'\e[1;36m'; c_0=$'\e[0m'
 
 say()  { echo -e "$*"; }
@@ -97,7 +95,7 @@ step_params() {
 
 step_packages() {
   apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y nginx certbot dnsutils curl python3 openssl git || return 1
-  mkdir -p /var/www/html "${PROBE%/*}"
+  mkdir -p /var/www/html/.well-known/acme-challenge
   [[ -f /var/www/html/index.html ]] || cat > /var/www/html/index.html <<EOF
 <!doctype html><html><head><meta charset="utf-8"><title>$CDN_DOMAIN</title></head><body><h1>$CDN_DOMAIN</h1></body></html>
 EOF
@@ -138,41 +136,84 @@ step_yc_cert() {
 }
 
 step_cdn() {
-  mkdir -p "${PROBE%/*}"; openssl rand -hex 16 > "$PROBE"
   say "${c_b}Если CDN-ресурс для ${CDN_DOMAIN} уже есть (переезд)${c_0} — открой его → «Редактировать»,"
-  say "поменяй ${c_b}Источник${c_0} на ${c_b}${SERVER_IP}${c_0} и сверь остальное со списком ниже. CNAME трогать не нужно."
-  todo "1. Certificate Manager: дождись статуса «Issued» у сертификата cdn-cert."
-  todo "2. Cloud CDN → «Создать ресурс»:"
-  say  "   Запрос контента: Из одного источника;  Тип источника: Сервер;  Источник: ${c_b}${SERVER_IP}${c_0}"
-  say  "   Протокол для источников: ${c_b}Как у клиента${c_0}   (нужно, чтобы сервер получил свой сертификат через CDN по HTTP)"
+  say "поставь источник / группу с IP ${c_b}${SERVER_IP}${c_0} и сверь настройки ниже. CNAME трогать не нужно."
+  say "Проверка, что CDN реально достучался до сервера, будет после выпуска сертификата и настройки nginx."
+  todo "1. Certificate Manager: сертификат для ${CDN_DOMAIN} в статусе «Issued»."
+  todo "2. Cloud CDN → ресурс (создать или изменить):"
+  say  "   Источник: IP ${c_b}${SERVER_IP}${c_0} (один сервер или группа источников с этим IP)"
+  say  "   Протокол для источников: ${c_b}HTTPS${c_0}"
+  say  "   Задать SNI вручную: ${c_b}вкл${c_0} → Имя SNI-хоста: ${c_b}${CDN_DOMAIN}${c_0}"
+  say  "   Заголовок Host: ${c_b}Своё значение${c_0} → ${c_b}${CDN_DOMAIN}${c_0}"
   say  "   Доменное имя: ${c_b}${CDN_DOMAIN}${c_0}"
-  say  "   Переадресация клиентов: ${c_b}Не использовать${c_0}"
-  say  "   Тип сертификата: ${c_b}Сертификат из Certificate Manager → cdn-cert${c_0}"
-  say  "   Заголовок Host: ${c_b}Основное доменное имя${c_0}"
+  say  "   Тип сертификата: ${c_b}Сертификат из Certificate Manager${c_0} (твой cdn-cert)"
+  say  "   Перенаправление: ${c_b}выкл${c_0}"
   say  "   Кеширование в CDN: выкл;  Кеширование в браузере: выкл"
   say  "   Разрешённые методы: GET, HEAD, OPTIONS"
-  say  "   Экранирование источников: выкл;  Выгрузка логов: выкл"
-  todo "3. Открой ресурс → внизу «Настройки DNS» → у регистратора CNAME:"
-  say  "   Имя: ${c_b}${CDN_DOMAIN%%.*}${c_0}   Значение: технический домен из консоли (xxxx.gslb.yccdn.ru)"
+  todo "3. CNAME у регистратора: имя ${c_b}${CDN_DOMAIN%%.*}${c_0} → технический домен из консоли (xxxx.gslb.yccdn.ru)"
   pause
   while true; do
-    local chain got
-    chain=$(resolve_chain "$CDN_DOMAIN")
-    got=$(curl -s --max-time 15 "http://$CDN_DOMAIN/.well-known/acme-challenge/cdn-probe")
+    local chain; chain=$(resolve_chain "$CDN_DOMAIN")
     say "  DNS: ${chain:-нет}"
-    if [[ "$chain" == *yccdn* && "$got" == "$(cat "$PROBE")" ]]; then ok "CDN доходит до сервера"; return 0; fi
-    [[ "$chain" != *yccdn* ]] && warn "CNAME ещё не указывает на Yandex CDN."
-    [[ "$chain" == *yccdn* ]] && warn "CDN пока не отдаёт файл с этого сервера (проверь источник ${SERVER_IP} и протокол «Как у клиента»)."
-    yes_no "Проверить снова через 2 минуты? (применение настроек CDN занимает до 15–30 минут)" y || { yes_no "Продолжить без проверки?" n && return 0 || return 1; }
+    if [[ "$chain" == *yccdn* ]]; then ok "CNAME указывает на Yandex CDN"; return 0; fi
+    warn "CNAME ещё не указывает на Yandex CDN."
+    yes_no "Проверить снова через 2 минуты?" y || { yes_no "Продолжить без проверки?" n && return 0 || return 1; }
     sleep 120
   done
 }
 
 step_cert() {
-  certbot certonly --webroot -w /var/www/html --cert-name "$CDN_DOMAIN" \
-    -d "$CDN_DOMAIN" --agree-tos --register-unsafely-without-email -n \
-    --deploy-hook "systemctl reload nginx" || { err "certbot не смог выпустить сертификат. Проверь CDN из прошлого шага (протокол «Как у клиента»)."; return 1; }
-  ok "Сертификат: /etc/letsencrypt/live/$CDN_DOMAIN/ (продлевается автоматически)"
+  local sub="${CDN_DOMAIN%%.*}"
+  if [[ -f /etc/letsencrypt/live/$CDN_DOMAIN/fullchain.pem ]]; then
+    ok "Сертификат уже есть: /etc/letsencrypt/live/$CDN_DOMAIN/"
+    return 0
+  fi
+  say "CDN ходит к серверу только по HTTPS — HTTP-проверка Let's Encrypt через CDN не работает (504)."
+  say "Выпускаем сертификат через ${c_b}DNS-01${c_0}: certbot покажет TXT-запись, ты добавишь её у регистратора."
+  say "Имя то же, что у сертификата Яндекса (${c_b}_acme-challenge.${sub}${c_0}) — несколько TXT на одном имени допустимы."
+  say "Старую TXT Яндекса не удаляй. После выпуска нашу TXT можно убрать."
+  todo "Сейчас запустится certbot → скопируй значение TXT → добавь у регистратора → подожди 1–2 минуты → нажми Enter в certbot."
+  pause
+  # certbot сам печатает имя/значение и ждёт Enter на tty
+  certbot certonly --manual --preferred-challenges dns \
+    --manual-public-ip-logging-ok \
+    --cert-name "$CDN_DOMAIN" -d "$CDN_DOMAIN" \
+    --agree-tos --register-unsafely-without-email \
+    --deploy-hook "systemctl reload nginx" </dev/tty \
+    || { err "certbot не выпустил сертификат. Проверь TXT _acme-challenge.${sub} у регистратора (dig TXT _acme-challenge.${CDN_DOMAIN})."; return 1; }
+  ok "Сертификат: /etc/letsencrypt/live/$CDN_DOMAIN/"
+}
+
+# После того как CDN ходит к серверу по HTTPS — продление можно делать через webroot (без TXT).
+switch_renew_to_webroot() {
+  local conf="/etc/letsencrypt/renewal/${CDN_DOMAIN}.conf"
+  [[ -f "$conf" ]] || return 0
+  sed -i 's/^authenticator = .*/authenticator = webroot/' "$conf"
+  if grep -q '^webroot_path' "$conf"; then sed -i 's|^webroot_path = .*|webroot_path = /var/www/html,|' "$conf"
+  else sed -i '/^authenticator = webroot/a webroot_path = /var/www/html,' "$conf"
+  fi
+  sed -i '/^manual_/d' "$conf"
+  if ! grep -q '\[\[webroot_map\]\]' "$conf"; then
+    printf '\n[[webroot_map]]\n%s = /var/www/html\n' "$CDN_DOMAIN" >> "$conf"
+  fi
+  ok "Продление сертификата переключено на webroot (через CDN по HTTPS)"
+}
+
+verify_cdn_https() {
+  say "Проверяем, что CDN достаёт этот сервер по HTTPS (источник ${SERVER_IP}, SNI/Host ${CDN_DOMAIN})..."
+  while true; do
+    local code; code=$(curl -s -o /dev/null --max-time 20 -w '%{http_code}' "https://$CDN_DOMAIN/")
+    say "  https://$CDN_DOMAIN/ → $code"
+    if [[ "$code" == 200 ]]; then
+      ok "CDN работает"
+      switch_renew_to_webroot
+      return 0
+    fi
+    [[ "$code" == 504 ]] && warn "504: CDN не достучался до сервера по HTTPS. Проверь источник ${SERVER_IP}, SNI и Host = ${CDN_DOMAIN}, что nginx слушает 443."
+    [[ "$code" == 502 || "$code" == 525 || "$code" == 526 ]] && warn "Ошибка TLS до источника: SNI должен быть ${CDN_DOMAIN}, сертификат на сервере — на этот же домен."
+    yes_no "Проверить снова через 2 минуты?" y || { yes_no "Продолжить без проверки?" n && return 0 || return 1; }
+    sleep 120
+  done
 }
 
 step_site() {
@@ -250,6 +291,9 @@ $h2_line
     keepalive_timeout 1h;
     keepalive_requests 100000;
 
+    # CDN ходит к источнику по HTTPS — сюда же прилетает ACME при продлении через webroot
+    location /.well-known/acme-challenge/ { root /var/www/html; }
+
     location $XHTTP_PATH {
         if (\$from_yc_cdn = 0) { return 404; }
         proxy_pass http://127.0.0.1:$XRAY_PORT;
@@ -273,6 +317,7 @@ EOF
   nginx -t && systemctl reload nginx || return 1
   local code; code=$(local_https /)
   [[ "$code" == 200 ]] && ok "nginx отдаёт https://$CDN_DOMAIN/ (200)" || warn "https://$CDN_DOMAIN/ на сервере ответил $code"
+  verify_cdn_https || return 1
 }
 
 step_xui() {
