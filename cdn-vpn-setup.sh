@@ -352,11 +352,22 @@ step_xui() {
   fi
 
   if [[ -n "$bk" ]]; then
+    command -v sqlite3 >/dev/null || DEBIAN_FRONTEND=noninteractive apt-get install -y -qq sqlite3 >/dev/null
     systemctl stop x-ui
-    rm -f /etc/x-ui/x-ui.db-wal /etc/x-ui/x-ui.db-shm
-    if [[ "$bk" == *.db ]]; then install -D -m 600 "$bk" /etc/x-ui/x-ui.db || return 1
-    else tar xzf "$bk" -C / etc/x-ui || { err "В архиве нет etc/x-ui"; return 1; }
+    rm -f /etc/x-ui/x-ui.db /etc/x-ui/x-ui.db-wal /etc/x-ui/x-ui.db-shm
+    if [[ "$bk" == *.db ]]; then
+      install -D -m 600 "$bk" /etc/x-ui/x-ui.db || return 1
+    else
+      tar xzf "$bk" -C / etc/x-ui || { err "В архиве нет etc/x-ui"; return 1; }
+      # данные часто лежат в WAL — сливаем в x-ui.db до старта панели
+      if [[ -f /etc/x-ui/x-ui.db-wal ]]; then
+        sqlite3 /etc/x-ui/x-ui.db "PRAGMA wal_checkpoint(TRUNCATE);" >/dev/null \
+          || { err "Не удалось применить x-ui.db-wal. Проверь: ls -la /etc/x-ui/"; return 1; }
+      fi
     fi
+    [[ -s /etc/x-ui/x-ui.db ]] || { err "После восстановления нет /etc/x-ui/x-ui.db"; return 1; }
+    local n_in; n_in=$(sqlite3 /etc/x-ui/x-ui.db "SELECT count(*) FROM inbounds;" 2>/dev/null || echo 0)
+    [[ "$n_in" -gt 0 ]] || warn "В базе 0 входящих — бэкап мог быть пустым (снимай после stop x-ui + wal_checkpoint)"
     systemctl start x-ui; sleep 5
     /usr/local/x-ui/x-ui setting -listenIP 127.0.0.1 -port $PANEL_PORT >/dev/null 2>&1
     /usr/local/x-ui/x-ui cert -reset >/dev/null 2>&1
@@ -364,7 +375,7 @@ step_xui() {
     path=$(xui_base_path)
     printf "URL:   http://localhost:8443/%s/\nLogin: (из бэкапа)\nPass:  (из бэкапа)\n" "$path" > $PANEL_TXT
     XUI_RESTORED=1; save XUI_RESTORED
-    ok "Настройки 3x-ui восстановлены из $bk (логин, пароль, подключения и клиенты — как на старом сервере)"
+    ok "Настройки 3x-ui восстановлены из $bk (входящих: $n_in; логин/пароль — из бэкапа)"
   else
     # пользователь панели создаётся при первом запуске x-ui, поэтому логин задаём после старта
     systemctl restart x-ui; sleep 5
