@@ -773,9 +773,15 @@ step_unlock() {
 }
 
 step_panel_proxy() {
-  local ip path crt="/etc/letsencrypt/live/${CDN_DOMAIN}" conf="/etc/letsencrypt/renewal/${CDN_DOMAIN}.conf"
-  [[ -f "$crt/fullchain.pem" ]] || { err "Нет сертификата $crt — сначала выполни полную настройку"; return 1; }
-  say "Панель будет слушать порт $PANEL_PORT по HTTPS, доступ — только с IP сервера, где стоит reverse proxy."
+  local ip path code panel_dom crt="/etc/letsencrypt/live/${CDN_DOMAIN}" conf="/etc/letsencrypt/renewal/${CDN_DOMAIN}.conf"
+  [[ -n "${CDN_DOMAIN:-}" ]] || { err "Не задан CDN_DOMAIN"; return 1; }
+  [[ -f "$crt/fullchain.pem" ]] || { err "Нет сертификата $crt — сначала выполни полную настройку (шаг с certbot)"; return 1; }
+  [[ -n "${SERVER_IP:-}" ]] || SERVER_IP=$(curl -4 -fsS --max-time 10 https://ifconfig.me)
+
+  say "Панель будет слушать ${c_b}0.0.0.0:${PANEL_PORT}${c_0} по ${c_b}HTTPS${c_0} (сертификат $CDN_DOMAIN)."
+  say "Снаружи порт ${PANEL_PORT} откроем только для IP Nginx Proxy Manager; остальным — drop."
+  ask_domain panel_dom "Домен панели в NPM (A → IP сервера с NPM)" "${PANEL_DOMAIN_PUBLIC:-3x-ui.iscreation.space}"
+  PANEL_DOMAIN_PUBLIC=$panel_dom; save PANEL_DOMAIN_PUBLIC
   while true; do
     ask ip "Публичный IPv4 сервера с Nginx Proxy Manager" "$(head -n1 /etc/cdn-lock/panel-allow.txt 2>/dev/null)"
     [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] && break
@@ -783,23 +789,50 @@ step_panel_proxy() {
   done
   mkdir -p /etc/cdn-lock; echo "$ip" > /etc/cdn-lock/panel-allow.txt
 
-  /usr/local/x-ui/x-ui setting -listenIP 0.0.0.0 -webCert "$crt/fullchain.pem" -webCertKey "$crt/privkey.pem" >/dev/null || return 1
+  /usr/local/x-ui/x-ui setting -listenIP 0.0.0.0 -port $PANEL_PORT \
+    -webCert "$crt/fullchain.pem" -webCertKey "$crt/privkey.pem" >/dev/null || return 1
   if [[ -f "$conf" ]]; then
     sed -i '/^renew_hook/d' "$conf"
     echo 'renew_hook = systemctl reload nginx; systemctl restart x-ui' >> "$conf"
   fi
-  systemctl restart x-ui
+  systemctl restart x-ui; sleep 3
   install_lock || return 1
 
   path=$(panel_path)
-  ok "Порт $PANEL_PORT открыт только для $ip"
-  say "\nВ Nginx Proxy Manager → Hosts → Proxy Hosts → Add Proxy Host:"
-  say "  Details:  Domain Names = ${c_b}<домен панели, например 3x-ui.iscreation.space>${c_0}"
-  say "            Scheme = ${c_b}https${c_0},  Forward Hostname / IP = ${c_b}${SERVER_IP}${c_0},  Forward Port = ${c_b}${PANEL_PORT}${c_0}"
-  say "            Websockets Support = вкл,  Block Common Exploits = вкл"
-  say "  SSL:      SSL Certificate = Request a new SSL Certificate,  Force SSL = вкл,  HTTP/2 Support = вкл"
-  say "  DNS домена панели: A-запись → IP сервера с Nginx Proxy Manager ($ip)"
-  say "\nПанель откроется по адресу: https://<домен панели>/${path:-<путь_панели>}/"
+  code=$(curl -sk -o /dev/null --max-time 8 -w '%{http_code}' "https://127.0.0.1:$PANEL_PORT/${path}/")
+  [[ "$code" == 200 || "$code" == 302 || "$code" == 401 ]] \
+    && ok "Панель по HTTPS локально отвечает ${code} на /${path}/" \
+    || warn "Локально https://127.0.0.1:$PANEL_PORT/${path}/ → $code (проверь: journalctl -u x-ui -n 30)"
+
+  ss -tlnp | grep -q ":$PANEL_PORT " && ok "Слушает порт $PANEL_PORT" || err "Порт $PANEL_PORT не слушается"
+
+  ok "Порт $PANEL_PORT открыт только для $ip (HTTPS)"
+  say "\n${c_b}Nginx Proxy Manager${c_0} → Hosts → Proxy Hosts → Edit:"
+  say "  Details:"
+  say "    Domain Names          = ${c_b}${panel_dom}${c_0}"
+  say "    Scheme                = ${c_b}https${c_0}"
+  say "    Forward Hostname / IP = ${c_b}${SERVER_IP}${c_0}"
+  say "    Forward Port          = ${c_b}${PANEL_PORT}${c_0}   ${c_y}(не 8443)${c_0}"
+  say "    Websockets Support    = вкл"
+  say "    Block Common Exploits = вкл"
+  say "  SSL:"
+  say "    SSL Certificate = Request a new SSL Certificate (для ${panel_dom})"
+  say "    Force SSL = вкл,  HTTP/2 = вкл"
+  say "  Advanced → Custom Nginx Configuration — вставь целиком:"
+  cat <<EOF
+${c_b}
+proxy_ssl_server_name on;
+proxy_ssl_name ${CDN_DOMAIN};
+proxy_ssl_verify off;
+proxy_set_header Host \$host;
+proxy_set_header X-Real-IP \$remote_addr;
+proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+proxy_set_header X-Forwarded-Proto \$scheme;
+${c_0}
+EOF
+  say "  DNS: A-запись ${c_b}${panel_dom}${c_0} → IP сервера с NPM (${ip})"
+  say "\nОткрывай: ${c_b}https://${panel_dom}/${path}/${c_0}"
+  say "Логин/пароль — из бэкапа / $PANEL_TXT"
 }
 
 panel_tunnel_hint() {
