@@ -109,6 +109,54 @@ xui_sqlite_counts() {
   sqlite3 /etc/x-ui/x-ui.db "SELECT (SELECT count(*) FROM inbounds)||' '||(SELECT count(*) FROM users)||' '||(SELECT count(*) FROM clients);" 2>/dev/null
 }
 
+# чтение/запись ключа settings (subURI, subPath, …)
+xui_get_setting() {
+  local key="$1" val=
+  xui_load_env
+  if [[ "$XUI_DB_TYPE" == postgres ]]; then
+    xui_parse_dsn "${XUI_DB_DSN:-}" || return 1
+    val=$(PGPASSWORD="$PG_PASS" psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_DB" -At -c \
+      "SELECT value FROM settings WHERE key='${key}';" 2>/dev/null) || return 1
+  else
+    command -v sqlite3 >/dev/null || apt-get install -y -qq sqlite3 >/dev/null
+    val=$(sqlite3 /etc/x-ui/x-ui.db "SELECT value FROM settings WHERE key='${key}';" 2>/dev/null) || return 1
+  fi
+  printf '%s' "$val"
+}
+
+xui_set_setting() {
+  local key="$1" val="$2" esc=
+  xui_load_env
+  if [[ "$XUI_DB_TYPE" == postgres ]]; then
+    xui_parse_dsn "${XUI_DB_DSN:-}" || return 1
+    esc=${val//\'/\'\'}
+    PGPASSWORD="$PG_PASS" psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_DB" -v ON_ERROR_STOP=1 -c \
+      "INSERT INTO settings (key, value) VALUES ('${key}', '${esc}')
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;" >/dev/null 2>&1 \
+    || PGPASSWORD="$PG_PASS" psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_DB" -v ON_ERROR_STOP=1 -c \
+      "UPDATE settings SET value='${esc}' WHERE key='${key}';
+       INSERT INTO settings (key, value) SELECT '${key}', '${esc}' WHERE NOT EXISTS (SELECT 1 FROM settings WHERE key='${key}');" >/dev/null \
+    || return 1
+  else
+    command -v sqlite3 >/dev/null || apt-get install -y -qq sqlite3 >/dev/null
+    esc=${val//\'/\'\'}
+    sqlite3 /etc/x-ui/x-ui.db \
+      "INSERT INTO settings (key, value) VALUES ('${key}', '${esc}')
+       ON CONFLICT(key) DO UPDATE SET value=excluded.value;" 2>/dev/null \
+    || sqlite3 /etc/x-ui/x-ui.db \
+      "UPDATE settings SET value='${esc}' WHERE key='${key}';
+       INSERT INTO settings (key, value) SELECT '${key}', '${esc}' WHERE NOT EXISTS (SELECT 1 FROM settings WHERE key='${key}');" \
+    || return 1
+  fi
+}
+
+xui_sub_path() { # путь подписок без слэшей
+  local p
+  p=$(xui_get_setting subPath 2>/dev/null || true)
+  p="${p#/}"; p="${p%/}"
+  printf '%s' "$p"
+}
+
 xui_write_env() { # xui_write_env TYPE [DSN]
   umask 077
   if [[ "$1" == postgres ]]; then
@@ -808,13 +856,13 @@ step_unlock() {
 }
 
 step_panel_proxy() {
-  local ip path code panel_dom crt="/etc/letsencrypt/live/${CDN_DOMAIN}" conf="/etc/letsencrypt/renewal/${CDN_DOMAIN}.conf"
+  local ip path subp code panel_dom sub_uri crt="/etc/letsencrypt/live/${CDN_DOMAIN}" conf="/etc/letsencrypt/renewal/${CDN_DOMAIN}.conf"
   [[ -n "${CDN_DOMAIN:-}" ]] || { err "Не задан CDN_DOMAIN"; return 1; }
   [[ -f "$crt/fullchain.pem" ]] || { err "Нет сертификата $crt — сначала выполни полную настройку (шаг с certbot)"; return 1; }
   [[ -n "${SERVER_IP:-}" ]] || SERVER_IP=$(curl -4 -fsS --max-time 10 https://ifconfig.me)
 
-  say "Панель ${c_b}${PANEL_PORT}${c_0} и подписки ${c_b}${SUB_PORT}${c_0} — HTTPS (сертификат $CDN_DOMAIN),"
-  say "снаружи оба порта только для IP Nginx Proxy Manager; остальным — drop."
+  say "Панель ${c_b}${PANEL_PORT}${c_0} и подписки ${c_b}${SUB_PORT}${c_0} — HTTPS (сертификат $CDN_DOMAIN)."
+  say "Снаружи оба порта только для IP NPM. Подписки наружу — через ${c_b}443${c_0} того же домена (без :2096)."
   ask_domain panel_dom "Домен панели/подписок в NPM (A → IP сервера с NPM)" "${PANEL_DOMAIN_PUBLIC:-3x-ui.iscreation.space}"
   PANEL_DOMAIN_PUBLIC=$panel_dom; save PANEL_DOMAIN_PUBLIC
   while true; do
@@ -826,6 +874,13 @@ step_panel_proxy() {
   # -webCert также прописывает subCertFile/subKeyFile в 3x-ui
   /usr/local/x-ui/x-ui setting -listenIP 0.0.0.0 -port $PANEL_PORT \
     -webCert "$crt/fullchain.pem" -webCertKey "$crt/privkey.pem" >/dev/null || return 1
+
+  # публичный URI подписок без :2096 — клиенты ходят на NPM:443, location шлёт на VPS:2096
+  sub_uri="https://${panel_dom}"
+  xui_set_setting subURI "$sub_uri" || warn "Не записал subURI в БД — выставь вручную в панели: $sub_uri"
+  xui_set_setting subDomain "$panel_dom" || true
+  # пустой Host-check сбрасывать не будем: Domain = panel_dom совпадает с Host от NPM
+
   if [[ -f "$conf" ]]; then
     sed -i '/^renew_hook/d' "$conf"
     echo 'renew_hook = systemctl reload nginx; systemctl restart x-ui' >> "$conf"
@@ -836,6 +891,9 @@ step_panel_proxy() {
   ensure_panel_allow "$ip" || return 1
 
   path=$(panel_path)
+  subp=$(xui_sub_path)
+  [[ -n "$subp" ]] || subp="sub"
+
   code=$(curl -sk -o /dev/null --max-time 8 -w '%{http_code}' "https://127.0.0.1:$PANEL_PORT/${path}/")
   [[ "$code" == 200 || "$code" == 302 || "$code" == 401 ]] \
     && ok "Панель по HTTPS локально отвечает ${code} на /${path}/" \
@@ -852,23 +910,25 @@ step_panel_proxy() {
   fi
 
   ok "Порты $PANEL_PORT и $SUB_PORT открыты только для $ip (HTTPS)"
+  ok "subURI = ${sub_uri}  (ссылки без :${SUB_PORT})"
   say "Проверка панели с NPM:     ${c_b}curl -vk --max-time 10 https://${SERVER_IP}:${PANEL_PORT}/${path}/${c_0}"
-  say "Проверка подписок с NPM:  ${c_b}curl -vk --max-time 10 https://${SERVER_IP}:${SUB_PORT}/${c_0}"
+  say "Проверка подписок с NPM:  ${c_b}curl -vk --max-time 10 https://${SERVER_IP}:${SUB_PORT}/${subp}/${c_0}"
 
-  say "\n${c_b}1) Nginx Proxy Manager — панель (443)${c_0} → Hosts → Proxy Hosts → Edit:"
+  say "\n${c_b}Nginx Proxy Manager${c_0} → Hosts → Proxy Hosts → Edit ${panel_dom}:"
   say "  Details:"
   say "    Domain Names          = ${c_b}${panel_dom}${c_0}"
   say "    Scheme                = ${c_b}https${c_0}"
   say "    Forward Hostname / IP = ${c_b}${SERVER_IP}${c_0}"
-  say "    Forward Port          = ${c_b}${PANEL_PORT}${c_0}   ${c_y}(не 8443)${c_0}"
+  say "    Forward Port          = ${c_b}${PANEL_PORT}${c_0}   ${c_y}(панель; подписки — через location ниже)${c_0}"
   say "    Websockets Support    = вкл"
   say "    Block Common Exploits = вкл"
   say "  SSL:"
   say "    SSL Certificate = Request a new SSL Certificate (для ${panel_dom})"
   say "    Force SSL = вкл,  HTTP/2 = вкл"
-  say "  Advanced → Custom Nginx Configuration — вставь целиком:"
+  say "  Advanced → Custom Nginx Configuration — ${c_y}замени целиком${c_0} на:"
   cat <<EOF
 ${c_b}
+# панель → :${PANEL_PORT}
 proxy_ssl_server_name on;
 proxy_ssl_name ${CDN_DOMAIN};
 proxy_ssl_verify off;
@@ -876,22 +936,25 @@ proxy_set_header Host \$host;
 proxy_set_header X-Real-IP \$remote_addr;
 proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
 proxy_set_header X-Forwarded-Proto \$scheme;
+
+# подписки → :${SUB_PORT} (тот же домен, порт 443 снаружи — без Streams/:${SUB_PORT})
+location ^~ /${subp}/ {
+  proxy_pass https://${SERVER_IP}:${SUB_PORT};
+  proxy_ssl_server_name on;
+  proxy_ssl_name ${CDN_DOMAIN};
+  proxy_ssl_verify off;
+  proxy_set_header Host \$host;
+  proxy_set_header X-Real-IP \$remote_addr;
+  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto \$scheme;
+}
 ${c_0}
 EOF
 
-  say "${c_b}2) Nginx Proxy Manager — подписки (:${SUB_PORT})${c_0} → Hosts → Streams → Add Stream:"
-  say "    Incoming Port      = ${c_b}${SUB_PORT}${c_0}"
-  say "    Forward Host       = ${c_b}${SERVER_IP}${c_0}"
-  say "    Forward Port       = ${c_b}${SUB_PORT}${c_0}"
-  say "    Forwarding Protocol = ${c_b}TCP${c_0}   (SSL passthrough до 3x-ui)"
-  say "  На сервере NPM порт ${SUB_PORT} должен быть проброшен в контейнер (например -p ${SUB_PORT}:${SUB_PORT})."
-  say "  В 3x-ui → Subscription: Domain = ${c_b}${panel_dom}${c_0}, Port = ${SUB_PORT}, URI = пусто"
-  say "    (сертификат sub уже = $CDN_DOMAIN; клиенты могут ругаться на имя — это нормально при passthrough,"
-  say "     либо выпусти LE на NPM для Stream не нужен: TLS терминирует 3x-ui)."
-
-  say "\n  DNS: A-запись ${c_b}${panel_dom}${c_0} → IP сервера с NPM (${ip})"
+  say "  DNS: A-запись ${c_b}${panel_dom}${c_0} → IP сервера с NPM (${ip})"
   say "\nПанель:     ${c_b}https://${panel_dom}/${path}/${c_0}"
-  say "Подписки:   ${c_b}https://${panel_dom}:${SUB_PORT}/<subPath>/<subId>${c_0}"
+  say "Подписки:   ${c_b}https://${panel_dom}/${subp}/<subId>${c_0}   ${c_y}(без :${SUB_PORT})${c_0}"
+  say "Старые ссылки с :${SUB_PORT} больше не нужны — возьми новые из панели."
   say "Логин/пароль — из бэкапа / $PANEL_TXT"
 }
 
