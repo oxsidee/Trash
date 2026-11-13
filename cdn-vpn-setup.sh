@@ -697,11 +697,20 @@ install_lock() {
 # 2053 (панель) — только с IP из /etc/cdn-lock/panel-allow.txt.
 # Список подсетей также пишется в nginx (geo $from_yc_cdn) — туннель отвечает только Yandex CDN.
 # SSH и 80 (продление Let's Encrypt через CDN) не трогаются. Отключить: nft delete table inet cdnlock
+set -euo pipefail
 CACHE=/etc/cdn-lock/prefixes.txt
 GEO=/etc/nginx/conf.d/cdn-geo.conf
 ALLOW=/etc/cdn-lock/panel-allow.txt
-PANEL_ACCEPT=""
-[ -s "$ALLOW" ] && PANEL_ACCEPT="tcp dport 2053 ip saddr { $(paste -sd, "$ALLOW") } accept"
+PANEL_SET=""
+PANEL_RULE=""
+if [[ -s "$ALLOW" ]]; then
+  # убрать пустые строки/CRLF, склеить через запятую
+  ips=$(tr -d '\r' < "$ALLOW" | awk 'NF' | paste -sd, -)
+  if [[ -n "$ips" ]]; then
+    PANEL_SET="set panel { type ipv4_addr; elements = { $ips } }"
+    PANEL_RULE="tcp dport 2053 ip saddr @panel accept"
+  fi
+fi
 tmp=$(mktemp)
 if curl -fsS --max-time 20 https://tech.cdn.yandex.net/prefixes/yc.json \
    | python3 -c 'import json,sys,ipaddress;[print(p) for p in json.load(sys.stdin)["prefixes"] if ipaddress.ip_network(p,strict=False).version==4]' > "$tmp" \
@@ -721,12 +730,13 @@ table inet cdnlock
 delete table inet cdnlock
 table inet cdnlock {
   set yc { type ipv4_addr; flags interval; auto-merge; elements = { $(paste -sd, "$CACHE") } }
+  $PANEL_SET
   chain input {
     type filter hook input priority -10; policy accept;
     iif lo accept
     ct state established,related accept
     tcp dport 443 ip saddr @yc accept
-    $PANEL_ACCEPT
+    $PANEL_RULE
     tcp dport { 443, 2053, 2096 } drop
     udp dport 443 drop
   }
@@ -743,6 +753,24 @@ EOF
 
   /usr/local/sbin/cdn-lock.sh || return 1
   ok "Порт 443 открыт только для Yandex CDN ($(wc -l < /etc/cdn-lock/prefixes.txt) подсетей), список обновляется ежедневно"
+}
+
+# Записать IP NPM и убедиться, что nft пропускает 2053 с него
+ensure_panel_allow() {
+  local ip="$1" rules
+  mkdir -p /etc/cdn-lock
+  printf '%s\n' "$ip" > /etc/cdn-lock/panel-allow.txt
+  chmod 600 /etc/cdn-lock/panel-allow.txt
+  # переустановить cdn-lock.sh (на случай старой версии без @panel) и применить
+  install_lock || return 1
+  /usr/local/sbin/cdn-lock.sh || return 1
+  rules=$(nft list chain inet cdnlock input 2>/dev/null || true)
+  if ! echo "$rules" | grep -qE "2053.*$ip|$ip.*2053|@panel"; then
+    err "nftables не пропускает 2053 для $ip. Сейчас правила:"
+    echo "$rules"
+    return 1
+  fi
+  ok "nftables: 2053 разрешён для $ip (до drop)"
 }
 
 step_lock() {
@@ -787,7 +815,6 @@ step_panel_proxy() {
     [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] && break
     err "Некорректный IPv4: '$ip'"
   done
-  mkdir -p /etc/cdn-lock; echo "$ip" > /etc/cdn-lock/panel-allow.txt
 
   /usr/local/x-ui/x-ui setting -listenIP 0.0.0.0 -port $PANEL_PORT \
     -webCert "$crt/fullchain.pem" -webCertKey "$crt/privkey.pem" >/dev/null || return 1
@@ -796,7 +823,9 @@ step_panel_proxy() {
     echo 'renew_hook = systemctl reload nginx; systemctl restart x-ui' >> "$conf"
   fi
   systemctl restart x-ui; sleep 3
-  install_lock || return 1
+
+  # сначала IP в allow + nft (иначе NPM получит 504: 2053 дропается до accept)
+  ensure_panel_allow "$ip" || return 1
 
   path=$(panel_path)
   code=$(curl -sk -o /dev/null --max-time 8 -w '%{http_code}' "https://127.0.0.1:$PANEL_PORT/${path}/")
@@ -807,6 +836,7 @@ step_panel_proxy() {
   ss -tlnp | grep -q ":$PANEL_PORT " && ok "Слушает порт $PANEL_PORT" || err "Порт $PANEL_PORT не слушается"
 
   ok "Порт $PANEL_PORT открыт только для $ip (HTTPS)"
+  say "Проверка с NPM:  ${c_b}curl -vk --max-time 10 https://${SERVER_IP}:${PANEL_PORT}/${path}/${c_0}"
   say "\n${c_b}Nginx Proxy Manager${c_0} → Hosts → Proxy Hosts → Edit:"
   say "  Details:"
   say "    Domain Names          = ${c_b}${panel_dom}${c_0}"
