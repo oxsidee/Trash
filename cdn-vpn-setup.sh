@@ -5,7 +5,7 @@
 #         bash cdn-vpn-setup.sh backup      — снять бэкап 3x-ui (Postgres или SQLite — авто)
 #         bash cdn-vpn-setup.sh lock        — пустить на 443 только Yandex CDN
 #         bash cdn-vpn-setup.sh unlock      — снять это ограничение
-#         bash cdn-vpn-setup.sh panel-proxy — открыть панель только для внешнего reverse proxy (например, Nginx Proxy Manager)
+#         bash cdn-vpn-setup.sh panel-proxy — открыть панель (2053) и подписки (2096) только для внешнего reverse proxy (NPM)
 # Ответы и прогресс сохраняются в /root/.cdn-vpn.env — скрипт можно прервать и запустить снова.
 
 set -u
@@ -14,6 +14,7 @@ STATE=/root/.cdn-vpn.env
 PANEL_TXT=/root/panel.txt
 XRAY_PORT=8080
 PANEL_PORT=2053
+SUB_PORT=2096
 c_g=$'\e[32m'; c_y=$'\e[33m'; c_r=$'\e[31m'; c_b=$'\e[1;36m'; c_0=$'\e[0m'
 
 say()  { echo -e "$*"; }
@@ -693,8 +694,8 @@ install_lock() {
   rm -f /etc/cdn-lock/open-443
   cat > /usr/local/sbin/cdn-lock.sh <<'EOF'
 #!/usr/bin/env bash
-# 443/tcp — только с подсетей Yandex CDN (официальный список), 2096 (подписки 3x-ui) — закрыт,
-# 2053 (панель) — только с IP из /etc/cdn-lock/panel-allow.txt.
+# 443/tcp — только с подсетей Yandex CDN (официальный список).
+# 2053 (панель) и 2096 (подписки) — только с IP из /etc/cdn-lock/panel-allow.txt (NPM).
 # Список подсетей также пишется в nginx (geo $from_yc_cdn) — туннель отвечает только Yandex CDN.
 # SSH и 80 (продление Let's Encrypt через CDN) не трогаются. Отключить: nft delete table inet cdnlock
 set -euo pipefail
@@ -708,7 +709,7 @@ if [[ -s "$ALLOW" ]]; then
   ips=$(tr -d '\r' < "$ALLOW" | awk 'NF' | paste -sd, -)
   if [[ -n "$ips" ]]; then
     PANEL_SET="set panel { type ipv4_addr; elements = { $ips } }"
-    PANEL_RULE="tcp dport 2053 ip saddr @panel accept"
+    PANEL_RULE="tcp dport { 2053, 2096 } ip saddr @panel accept"
   fi
 fi
 tmp=$(mktemp)
@@ -755,7 +756,7 @@ EOF
   ok "Порт 443 открыт только для Yandex CDN ($(wc -l < /etc/cdn-lock/prefixes.txt) подсетей), список обновляется ежедневно"
 }
 
-# Записать IP NPM и убедиться, что nft пропускает 2053 с него
+# Записать IP NPM и убедиться, что nft пропускает 2053 и 2096 с него
 ensure_panel_allow() {
   local ip="$1" rules
   mkdir -p /etc/cdn-lock
@@ -765,19 +766,25 @@ ensure_panel_allow() {
   install_lock || return 1
   /usr/local/sbin/cdn-lock.sh || return 1
   rules=$(nft list chain inet cdnlock input 2>/dev/null || true)
-  if ! echo "$rules" | grep -qE "2053.*$ip|$ip.*2053|@panel"; then
-    err "nftables не пропускает 2053 для $ip. Сейчас правила:"
+  if ! echo "$rules" | grep -q '@panel'; then
+    err "nftables: нет set/правила @panel для $ip. Сейчас:"
     echo "$rules"
     return 1
   fi
-  ok "nftables: 2053 разрешён для $ip (до drop)"
+  if ! echo "$rules" | grep -qE '2053.*2096|2096.*2053'; then
+    err "nftables: нет accept для портов 2053/2096 с @panel. Сейчас:"
+    echo "$rules"
+    return 1
+  fi
+  ok "nftables: 2053 и 2096 разрешены для $ip (до drop)"
 }
 
 step_lock() {
   say "Закроем сервер от всех, кроме узлов Yandex CDN:"
   say "  • 443 — только с подсетей Yandex CDN, туннель отвечает только им;"
   say "  • 80 — только для продления сертификата, остальное соединение сбрасывается;"
-  say "  • панель (2053) и подписки (2096) закрыты, SSH не трогается."
+  say "  • панель (2053) и подписки (2096) закрыты для всех, кроме IP из panel-allow (если задан);"
+  say "  • SSH не трогается."
   yes_no "Включить?" y || { warn "Пропущено. Включить позже: bash $0 lock"; return 0; }
   install_lock || return 1
   sleep 3
@@ -806,9 +813,9 @@ step_panel_proxy() {
   [[ -f "$crt/fullchain.pem" ]] || { err "Нет сертификата $crt — сначала выполни полную настройку (шаг с certbot)"; return 1; }
   [[ -n "${SERVER_IP:-}" ]] || SERVER_IP=$(curl -4 -fsS --max-time 10 https://ifconfig.me)
 
-  say "Панель будет слушать ${c_b}0.0.0.0:${PANEL_PORT}${c_0} по ${c_b}HTTPS${c_0} (сертификат $CDN_DOMAIN)."
-  say "Снаружи порт ${PANEL_PORT} откроем только для IP Nginx Proxy Manager; остальным — drop."
-  ask_domain panel_dom "Домен панели в NPM (A → IP сервера с NPM)" "${PANEL_DOMAIN_PUBLIC:-3x-ui.iscreation.space}"
+  say "Панель ${c_b}${PANEL_PORT}${c_0} и подписки ${c_b}${SUB_PORT}${c_0} — HTTPS (сертификат $CDN_DOMAIN),"
+  say "снаружи оба порта только для IP Nginx Proxy Manager; остальным — drop."
+  ask_domain panel_dom "Домен панели/подписок в NPM (A → IP сервера с NPM)" "${PANEL_DOMAIN_PUBLIC:-3x-ui.iscreation.space}"
   PANEL_DOMAIN_PUBLIC=$panel_dom; save PANEL_DOMAIN_PUBLIC
   while true; do
     ask ip "Публичный IPv4 сервера с Nginx Proxy Manager" "$(head -n1 /etc/cdn-lock/panel-allow.txt 2>/dev/null)"
@@ -816,6 +823,7 @@ step_panel_proxy() {
     err "Некорректный IPv4: '$ip'"
   done
 
+  # -webCert также прописывает subCertFile/subKeyFile в 3x-ui
   /usr/local/x-ui/x-ui setting -listenIP 0.0.0.0 -port $PANEL_PORT \
     -webCert "$crt/fullchain.pem" -webCertKey "$crt/privkey.pem" >/dev/null || return 1
   if [[ -f "$conf" ]]; then
@@ -824,7 +832,7 @@ step_panel_proxy() {
   fi
   systemctl restart x-ui; sleep 3
 
-  # сначала IP в allow + nft (иначе NPM получит 504: 2053 дропается до accept)
+  # IP в allow + nft (иначе NPM получит 504: порты дропаются до accept)
   ensure_panel_allow "$ip" || return 1
 
   path=$(panel_path)
@@ -834,10 +842,20 @@ step_panel_proxy() {
     || warn "Локально https://127.0.0.1:$PANEL_PORT/${path}/ → $code (проверь: journalctl -u x-ui -n 30)"
 
   ss -tlnp | grep -q ":$PANEL_PORT " && ok "Слушает порт $PANEL_PORT" || err "Порт $PANEL_PORT не слушается"
+  if ss -tlnp | grep -q ":$SUB_PORT "; then
+    ok "Слушает порт $SUB_PORT (подписки)"
+    code=$(curl -sk -o /dev/null --max-time 8 -w '%{http_code}' "https://127.0.0.1:$SUB_PORT/")
+    [[ "$code" != 000 ]] && ok "Подписки локально отвечают на HTTPS :$SUB_PORT (код $code)" \
+      || warn "Подписки на :$SUB_PORT не ответили — проверь subEnable/subCert в панели"
+  else
+    warn "Порт $SUB_PORT не слушается — включи Subscription в настройках 3x-ui"
+  fi
 
-  ok "Порт $PANEL_PORT открыт только для $ip (HTTPS)"
-  say "Проверка с NPM:  ${c_b}curl -vk --max-time 10 https://${SERVER_IP}:${PANEL_PORT}/${path}/${c_0}"
-  say "\n${c_b}Nginx Proxy Manager${c_0} → Hosts → Proxy Hosts → Edit:"
+  ok "Порты $PANEL_PORT и $SUB_PORT открыты только для $ip (HTTPS)"
+  say "Проверка панели с NPM:     ${c_b}curl -vk --max-time 10 https://${SERVER_IP}:${PANEL_PORT}/${path}/${c_0}"
+  say "Проверка подписок с NPM:  ${c_b}curl -vk --max-time 10 https://${SERVER_IP}:${SUB_PORT}/${c_0}"
+
+  say "\n${c_b}1) Nginx Proxy Manager — панель (443)${c_0} → Hosts → Proxy Hosts → Edit:"
   say "  Details:"
   say "    Domain Names          = ${c_b}${panel_dom}${c_0}"
   say "    Scheme                = ${c_b}https${c_0}"
@@ -860,8 +878,20 @@ proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
 proxy_set_header X-Forwarded-Proto \$scheme;
 ${c_0}
 EOF
-  say "  DNS: A-запись ${c_b}${panel_dom}${c_0} → IP сервера с NPM (${ip})"
-  say "\nОткрывай: ${c_b}https://${panel_dom}/${path}/${c_0}"
+
+  say "${c_b}2) Nginx Proxy Manager — подписки (:${SUB_PORT})${c_0} → Hosts → Streams → Add Stream:"
+  say "    Incoming Port      = ${c_b}${SUB_PORT}${c_0}"
+  say "    Forward Host       = ${c_b}${SERVER_IP}${c_0}"
+  say "    Forward Port       = ${c_b}${SUB_PORT}${c_0}"
+  say "    Forwarding Protocol = ${c_b}TCP${c_0}   (SSL passthrough до 3x-ui)"
+  say "  На сервере NPM порт ${SUB_PORT} должен быть проброшен в контейнер (например -p ${SUB_PORT}:${SUB_PORT})."
+  say "  В 3x-ui → Subscription: Domain = ${c_b}${panel_dom}${c_0}, Port = ${SUB_PORT}, URI = пусто"
+  say "    (сертификат sub уже = $CDN_DOMAIN; клиенты могут ругаться на имя — это нормально при passthrough,"
+  say "     либо выпусти LE на NPM для Stream не нужен: TLS терминирует 3x-ui)."
+
+  say "\n  DNS: A-запись ${c_b}${panel_dom}${c_0} → IP сервера с NPM (${ip})"
+  say "\nПанель:     ${c_b}https://${panel_dom}/${path}/${c_0}"
+  say "Подписки:   ${c_b}https://${panel_dom}:${SUB_PORT}/<subPath>/<subId>${c_0}"
   say "Логин/пароль — из бэкапа / $PANEL_TXT"
 }
 
