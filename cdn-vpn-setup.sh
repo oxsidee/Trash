@@ -2,10 +2,11 @@
 # VLESS + XHTTP через Yandex Cloud CDN: nginx + certbot + 3x-ui (+ сайт на главной CDN-домена).
 # Схема: CDN-домен (CNAME на Yandex CDN) → источник — IP этого сервера. Остальной домен сервер не касается.
 # Запуск: bash cdn-vpn-setup.sh             — полная настройка нового сервера (под root, Ubuntu/Debian)
-#         bash cdn-vpn-setup.sh backup      — снять бэкап 3x-ui (Postgres или SQLite — авто)
+#         bash cdn-vpn-setup.sh backup      — бэкап 3x-ui на ЭТОМ сервере (Postgres+SQLite+sub-theme)
 #         bash cdn-vpn-setup.sh lock        — пустить на 443 только Yandex CDN
 #         bash cdn-vpn-setup.sh unlock      — снять это ограничение
-#         bash cdn-vpn-setup.sh panel-proxy — открыть панель только для внешнего reverse proxy (например, Nginx Proxy Manager)
+#         bash cdn-vpn-setup.sh panel-proxy — открыть панель (2053) и подписки (2096) только для внешнего reverse proxy (NPM)
+# Со старого сервера удобнее: bash cdn-vpn-export.sh (рядом в репозитории).
 # Ответы и прогресс сохраняются в /root/.cdn-vpn.env — скрипт можно прервать и запустить снова.
 
 set -u
@@ -14,6 +15,7 @@ STATE=/root/.cdn-vpn.env
 PANEL_TXT=/root/panel.txt
 XRAY_PORT=8080
 PANEL_PORT=2053
+SUB_PORT=2096
 c_g=$'\e[32m'; c_y=$'\e[33m'; c_r=$'\e[31m'; c_b=$'\e[1;36m'; c_0=$'\e[0m'
 
 say()  { echo -e "$*"; }
@@ -108,6 +110,54 @@ xui_sqlite_counts() {
   sqlite3 /etc/x-ui/x-ui.db "SELECT (SELECT count(*) FROM inbounds)||' '||(SELECT count(*) FROM users)||' '||(SELECT count(*) FROM clients);" 2>/dev/null
 }
 
+# чтение/запись ключа settings (subURI, subPath, …)
+xui_get_setting() {
+  local key="$1" val=
+  xui_load_env
+  if [[ "$XUI_DB_TYPE" == postgres ]]; then
+    xui_parse_dsn "${XUI_DB_DSN:-}" || return 1
+    val=$(PGPASSWORD="$PG_PASS" psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_DB" -At -c \
+      "SELECT value FROM settings WHERE key='${key}';" 2>/dev/null) || return 1
+  else
+    command -v sqlite3 >/dev/null || apt-get install -y -qq sqlite3 >/dev/null
+    val=$(sqlite3 /etc/x-ui/x-ui.db "SELECT value FROM settings WHERE key='${key}';" 2>/dev/null) || return 1
+  fi
+  printf '%s' "$val"
+}
+
+xui_set_setting() {
+  local key="$1" val="$2" esc=
+  xui_load_env
+  if [[ "$XUI_DB_TYPE" == postgres ]]; then
+    xui_parse_dsn "${XUI_DB_DSN:-}" || return 1
+    esc=${val//\'/\'\'}
+    PGPASSWORD="$PG_PASS" psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_DB" -v ON_ERROR_STOP=1 -c \
+      "INSERT INTO settings (key, value) VALUES ('${key}', '${esc}')
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;" >/dev/null 2>&1 \
+    || PGPASSWORD="$PG_PASS" psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_DB" -v ON_ERROR_STOP=1 -c \
+      "UPDATE settings SET value='${esc}' WHERE key='${key}';
+       INSERT INTO settings (key, value) SELECT '${key}', '${esc}' WHERE NOT EXISTS (SELECT 1 FROM settings WHERE key='${key}');" >/dev/null \
+    || return 1
+  else
+    command -v sqlite3 >/dev/null || apt-get install -y -qq sqlite3 >/dev/null
+    esc=${val//\'/\'\'}
+    sqlite3 /etc/x-ui/x-ui.db \
+      "INSERT INTO settings (key, value) VALUES ('${key}', '${esc}')
+       ON CONFLICT(key) DO UPDATE SET value=excluded.value;" 2>/dev/null \
+    || sqlite3 /etc/x-ui/x-ui.db \
+      "UPDATE settings SET value='${esc}' WHERE key='${key}';
+       INSERT INTO settings (key, value) SELECT '${key}', '${esc}' WHERE NOT EXISTS (SELECT 1 FROM settings WHERE key='${key}');" \
+    || return 1
+  fi
+}
+
+xui_sub_path() { # путь подписок без слэшей
+  local p
+  p=$(xui_get_setting subPath 2>/dev/null || true)
+  p="${p#/}"; p="${p%/}"
+  printf '%s' "$p"
+}
+
 xui_write_env() { # xui_write_env TYPE [DSN]
   umask 077
   if [[ "$1" == postgres ]]; then
@@ -137,60 +187,102 @@ xui_pg_prepare_db() { # создаёт роль/БД из PG_*
 }
 
 step_backup() {
+  # тот же формат, что cdn-vpn-export.sh
+  local self_dir export_sh
+  self_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+  export_sh="$self_dir/cdn-vpn-export.sh"
+  if [[ -f "$export_sh" ]]; then
+    bash "$export_sh" || return 1
+    return 0
+  fi
+  # fallback, если export-скрипт не рядом (скачали только setup)
+  warn "cdn-vpn-export.sh не найден рядом — встроенный бэкап"
   xui_load_env
-  local out="/root/3xui-backup-$(date +%F-%H%M).tar.gz" tmp
+  local out="/root/3xui-backup-$(date +%F-%H%M).tar.gz" tmp have_pg=0 have_sqlite=0
   tmp=$(mktemp -d); trap 'rm -rf "$tmp"' RETURN
-  mkdir -p "$tmp/meta"
-  if [[ -f /etc/default/x-ui ]]; then cp -a /etc/default/x-ui "$tmp/meta/x-ui.env"; fi
-  echo "db_type=$XUI_DB_TYPE" > "$tmp/meta/type.txt"
-  echo "created=$(date -Is)" >> "$tmp/meta/type.txt"
+  mkdir -p "$tmp/meta" "$tmp/db" "$tmp/etc/x-ui"
+  [[ -f /etc/default/x-ui ]] && cp -a /etc/default/x-ui "$tmp/meta/x-ui.env"
+  {
+    echo "format=cdn-vpn-export-v1"
+    echo "created=$(date -Is)"
+    echo "active_db=$XUI_DB_TYPE"
+  } > "$tmp/meta/type.txt"
 
   systemctl stop x-ui 2>/dev/null || true
-  if [[ "$XUI_DB_TYPE" == postgres ]]; then
-    xui_parse_dsn "${XUI_DB_DSN:-}" || { err "Не разобрать XUI_DB_DSN в /etc/default/x-ui"; systemctl start x-ui; return 1; }
-    command -v pg_dump >/dev/null || { apt-get install -y -qq postgresql-client >/dev/null; }
-    say "Снимаю Postgres-дамп ${PG_DB}@${PG_HOST} ..."
-    PGPASSWORD="$PG_PASS" pg_dump -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_DB" -Fc -f "$tmp/xui-pg.dump" \
-      || { err "pg_dump не удался"; systemctl start x-ui; return 1; }
-    local counts; counts=$(xui_pg_counts || true)
-    echo "counts_inbounds_users_clients=$counts" >> "$tmp/meta/type.txt"
-    say "В базе: inbounds/users/clients = ${counts:-(не удалось посчитать)}"
-    [[ "${counts%% *}" =~ ^[1-9] ]] || warn "Входящих 0 — на новом сервере после restore панель будет пустой"
-  else
-    command -v sqlite3 >/dev/null || DEBIAN_FRONTEND=noninteractive apt-get install -y -qq sqlite3 >/dev/null
-    [[ -f /etc/x-ui/x-ui.db ]] || { err "Нет /etc/x-ui/x-ui.db"; systemctl start x-ui; return 1; }
-    sqlite3 /etc/x-ui/x-ui.db "PRAGMA wal_checkpoint(TRUNCATE);" >/dev/null
-    local counts; counts=$(xui_sqlite_counts || true)
-    echo "counts_inbounds_users_clients=$counts" >> "$tmp/meta/type.txt"
-    say "В базе: inbounds/users/clients = ${counts:-(не удалось посчитать)}"
-    [[ "${counts%% *}" =~ ^[1-9] ]] || warn "Входящих 0 — если панель на Postgres, бэкапь через неё (XUI_DB_TYPE=postgres)"
-    mkdir -p "$tmp/etc"
-    cp -a /etc/x-ui "$tmp/etc/"
+  if [[ -n "${XUI_DB_DSN:-}" ]] && xui_parse_dsn "$XUI_DB_DSN"; then
+    command -v pg_dump >/dev/null || apt-get install -y -qq postgresql-client >/dev/null
+    if PGPASSWORD="$PG_PASS" pg_dump -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_DB" -Fc -f "$tmp/db/xui-pg.dump"; then
+      have_pg=1
+      cp -a "$tmp/db/xui-pg.dump" "$tmp/xui-pg.dump"
+      echo "postgres_counts_inbounds_users_clients=$(xui_pg_counts || true)" >> "$tmp/meta/type.txt"
+    fi
   fi
-  systemctl start x-ui
-
+  if [[ -f /etc/x-ui/x-ui.db ]]; then
+    command -v sqlite3 >/dev/null || DEBIAN_FRONTEND=noninteractive apt-get install -y -qq sqlite3 >/dev/null
+    sqlite3 /etc/x-ui/x-ui.db "PRAGMA wal_checkpoint(TRUNCATE);" >/dev/null 2>&1 || true
+    cp -a /etc/x-ui/x-ui.db "$tmp/db/x-ui.db"
+    cp -a /etc/x-ui/x-ui.db "$tmp/etc/x-ui/x-ui.db"
+    have_sqlite=1
+    echo "sqlite_counts_inbounds_users_clients=$(xui_sqlite_counts || true)" >> "$tmp/meta/type.txt"
+  fi
+  [[ -d /etc/x-ui/sub-theme ]] && cp -a /etc/x-ui/sub-theme "$tmp/etc/x-ui/"
+  echo "have_postgres=$have_pg" >> "$tmp/meta/type.txt"
+  echo "have_sqlite=$have_sqlite" >> "$tmp/meta/type.txt"
+  systemctl start x-ui 2>/dev/null || true
+  [[ $have_pg -eq 1 || $have_sqlite -eq 1 ]] || { err "Нет ни Postgres, ни SQLite для бэкапа"; return 1; }
   tar czf "$out" -C "$tmp" .
   chmod 600 "$out"
   ok "Бэкап: $out ($(du -h "$out" | awk '{print $1}'))"
-  say "Скачать к себе:  ${c_b}scp root@$(curl -4 -fsS --max-time 5 https://ifconfig.me 2>/dev/null || echo SERVER):$out .${c_0}"
-  say "На новый сервер: ${c_b}scp $(basename "$out") root@НОВЫЙ_IP:/root/${c_0}"
-  say "Там:              ${c_b}bash cdn-vpn-setup.sh${c_0} → на шаге 3x-ui укажи путь к этому архиву"
 }
 
 # определить тип файла бэкапа → postgres|sqlite|""
 xui_backup_kind() {
-  local f="$1"
+  local f="$1" list active
   case "$f" in
     *.dump|*.sql) echo postgres; return ;;
     *.db) echo sqlite; return ;;
   esac
-  if tar tzf "$f" 2>/dev/null | grep -qE '(^|/)xui-pg\.dump$'; then echo postgres; return; fi
-  if tar tzf "$f" 2>/dev/null | grep -qE '(^|/)x-ui\.db$'; then echo sqlite; return; fi
+  list=$(tar tzf "$f" 2>/dev/null || true)
+  active=$(tar xzf "$f" -O meta/type.txt 2>/dev/null | sed -n 's/^active_db=//p' | head -n1)
+  if [[ "$active" == postgres ]] && echo "$list" | grep -qE '(^|/)xui-pg\.dump$'; then echo postgres; return; fi
+  if [[ "$active" == sqlite ]] && echo "$list" | grep -qE '(^|/)x-ui\.db$'; then echo sqlite; return; fi
+  # обе базы в архиве — предпочитаем Postgres (как на проде с XUI_DB_TYPE=postgres)
+  if echo "$list" | grep -qE '(^|/)xui-pg\.dump$'; then echo postgres; return; fi
+  if echo "$list" | grep -qE '(^|/)x-ui\.db$'; then echo sqlite; return; fi
   echo ""
 }
 
+# восстановить sub-theme и прочие файлы из распакованного tmp
+xui_restore_files_from_tmp() {
+  local tmp="$1"
+  mkdir -p /etc/x-ui
+  if [[ -d "$tmp/etc/x-ui/sub-theme" ]]; then
+    rm -rf /etc/x-ui/sub-theme
+    cp -a "$tmp/etc/x-ui/sub-theme" /etc/x-ui/
+    ok "Восстановлен /etc/x-ui/sub-theme"
+  elif [[ -d "$tmp/sub-theme" ]]; then
+    rm -rf /etc/x-ui/sub-theme
+    cp -a "$tmp/sub-theme" /etc/x-ui/
+    ok "Восстановлен /etc/x-ui/sub-theme"
+  else
+    warn "В архиве нет sub-theme — пропуск"
+  fi
+  # прочие файлы панели (кроме db)
+  if [[ -d "$tmp/etc/x-ui" ]]; then
+    local f rel
+    while IFS= read -r -d '' f; do
+      rel="${f#$tmp/etc/x-ui/}"
+      case "$rel" in
+        x-ui.db|x-ui.db-wal|x-ui.db-shm|sub-theme|sub-theme/*) continue ;;
+      esac
+      mkdir -p "/etc/x-ui/$(dirname "$rel")"
+      cp -a "$f" "/etc/x-ui/$rel"
+    done < <(find "$tmp/etc/x-ui" -mindepth 1 \( -type f -o -type l \) ! -name 'x-ui.db*' -print0 2>/dev/null)
+  fi
+}
+
 xui_restore_postgres() {
-  local bk="$1" dump="$bk" envf="" tmp
+  local bk="$1" dump="$bk" envf="" tmp="" sqlite_side=""
   command -v pg_restore >/dev/null || xui_ensure_postgres || return 1
   xui_ensure_postgres || return 1
 
@@ -199,7 +291,9 @@ xui_restore_postgres() {
     tar xzf "$bk" -C "$tmp" || { rm -rf "$tmp"; return 1; }
     dump=$(find "$tmp" -name 'xui-pg.dump' | head -n1)
     envf=$(find "$tmp" -name 'x-ui.env' | head -n1)
+    sqlite_side=$(find "$tmp" -name 'x-ui.db' | head -n1)
     [[ -n "$dump" ]] || { err "В архиве нет xui-pg.dump"; rm -rf "$tmp"; return 1; }
+    xui_restore_files_from_tmp "$tmp"
   fi
 
   if [[ -n "$envf" ]]; then
@@ -230,6 +324,12 @@ xui_restore_postgres() {
     --no-owner --clean --if-exists "$dump" >/tmp/xui-pg-restore.log 2>&1 \
     || warn "pg_restore завершился с предупреждениями (часто нормально) — смотри /tmp/xui-pg-restore.log"
 
+  # SQLite из того же архива — на диск (панель всё равно на Postgres)
+  if [[ -n "$sqlite_side" ]]; then
+    install -D -m 600 "$sqlite_side" /etc/x-ui/x-ui.db
+    ok "SQLite из архива положен в /etc/x-ui/x-ui.db (активен Postgres)"
+  fi
+
   xui_write_env postgres "$XUI_DB_DSN"
   local counts; counts=$(xui_pg_counts || echo "0 0 0")
   say "После restore: inbounds/users/clients = $counts"
@@ -240,19 +340,25 @@ xui_restore_postgres() {
 }
 
 xui_restore_sqlite() {
-  local bk="$1"
+  local bk="$1" tmp=""
   command -v sqlite3 >/dev/null || DEBIAN_FRONTEND=noninteractive apt-get install -y -qq sqlite3 >/dev/null
   rm -f /etc/x-ui/x-ui.db /etc/x-ui/x-ui.db-wal /etc/x-ui/x-ui.db-shm
   if [[ "$bk" == *.db ]]; then
     install -D -m 600 "$bk" /etc/x-ui/x-ui.db || return 1
   else
-    local tmp; tmp=$(mktemp -d)
+    tmp=$(mktemp -d)
     tar xzf "$bk" -C "$tmp" || { rm -rf "$tmp"; return 1; }
-    if [[ -d "$tmp/etc/x-ui" ]]; then cp -a "$tmp/etc/x-ui/." /etc/x-ui/
+    xui_restore_files_from_tmp "$tmp"
+    if [[ -f "$tmp/db/x-ui.db" ]]; then install -D -m 600 "$tmp/db/x-ui.db" /etc/x-ui/x-ui.db
+    elif [[ -f "$tmp/etc/x-ui/x-ui.db" ]]; then install -D -m 600 "$tmp/etc/x-ui/x-ui.db" /etc/x-ui/x-ui.db
     elif [[ -f "$tmp/x-ui.db" ]]; then install -D -m 600 "$tmp/x-ui.db" /etc/x-ui/x-ui.db
+    elif [[ -d "$tmp/etc/x-ui" ]]; then cp -a "$tmp/etc/x-ui/." /etc/x-ui/
     else
-      # старый формат: etc/x-ui в корне архива относительно /
-      tar xzf "$bk" -C / etc/x-ui 2>/dev/null || { err "В архиве нет etc/x-ui"; rm -rf "$tmp"; return 1; }
+      tar xzf "$bk" -C / etc/x-ui 2>/dev/null || { err "В архиве нет x-ui.db"; rm -rf "$tmp"; return 1; }
+    fi
+    # если в архиве ещё и Postgres — восстановим его тоже, но активным оставим sqlite (active_db)
+    if [[ -f "$tmp/db/xui-pg.dump" || -f "$tmp/xui-pg.dump" ]]; then
+      warn "В архиве есть и Postgres-дамп; активный движок — SQLite (как в meta). Postgres можно поднять отдельно."
     fi
     rm -rf "$tmp"
   fi
@@ -265,7 +371,7 @@ xui_restore_sqlite() {
   local counts; counts=$(xui_sqlite_counts || echo "0 0 0")
   say "После restore: inbounds/users/clients = $counts"
   if [[ ! "${counts%% *}" =~ ^[1-9] ]]; then
-    err "В SQLite 0 входящих. Если на старом сервере был Postgres — снимай бэкап так: bash $0 backup"
+    err "В SQLite 0 входящих. Если на старом сервере был Postgres — снимай: bash cdn-vpn-export.sh"
     return 1
   fi
   ok "SQLite восстановлен"
@@ -530,16 +636,16 @@ step_xui() {
     [[ -f "$f" ]] && { bk=$f; break; }
   done
   say "Бэкап 3x-ui со старого сервера (если переезд):"
-  say "  • Postgres: архив от ${c_b}bash $0 backup${c_0} или файл ${c_b}xui-pg.dump${c_0}"
-  say "  • SQLite:   архив с etc/x-ui или файл x-ui.db"
+  say "  На старом: ${c_b}bash cdn-vpn-export.sh${c_0}  (Postgres + SQLite + /etc/x-ui/sub-theme)"
+  say "  Или здесь: ${c_b}bash $0 backup${c_0}"
   say "Залей на этот сервер: scp бэкап root@${SERVER_IP}:/root/"
   ask bk "Путь к бэкапу (- или пусто — чистая установка)" "$bk"
   [[ "$bk" == - ]] && bk=""
   [[ -z "$bk" || -f "$bk" ]] || { err "Нет файла $bk"; return 1; }
   if [[ -n "$bk" ]]; then
     kind=$(xui_backup_kind "$bk")
-    [[ -n "$kind" ]] || { err "Не понял тип бэкапа ($bk). Нужен xui-pg.dump / *.db / архив от «$0 backup»"; return 1; }
-    say "Тип бэкапа: ${c_b}$kind${c_0}"
+    [[ -n "$kind" ]] || { err "Не понял тип бэкапа ($bk). Нужен архив от cdn-vpn-export.sh / $0 backup"; return 1; }
+    say "Тип бэкапа (активная БД): ${c_b}$kind${c_0}  — восстановятся БД, sub-theme и файлы панели"
   fi
 
   if [[ -f $PANEL_TXT ]]; then
@@ -693,8 +799,8 @@ install_lock() {
   rm -f /etc/cdn-lock/open-443
   cat > /usr/local/sbin/cdn-lock.sh <<'EOF'
 #!/usr/bin/env bash
-# 443/tcp — только с подсетей Yandex CDN (официальный список), 2096 (подписки 3x-ui) — закрыт,
-# 2053 (панель) — только с IP из /etc/cdn-lock/panel-allow.txt.
+# 443/tcp — только с подсетей Yandex CDN (официальный список).
+# 2053 (панель) и 2096 (подписки) — только с IP из /etc/cdn-lock/panel-allow.txt (NPM).
 # Список подсетей также пишется в nginx (geo $from_yc_cdn) — туннель отвечает только Yandex CDN.
 # SSH и 80 (продление Let's Encrypt через CDN) не трогаются. Отключить: nft delete table inet cdnlock
 set -euo pipefail
@@ -708,7 +814,7 @@ if [[ -s "$ALLOW" ]]; then
   ips=$(tr -d '\r' < "$ALLOW" | awk 'NF' | paste -sd, -)
   if [[ -n "$ips" ]]; then
     PANEL_SET="set panel { type ipv4_addr; elements = { $ips } }"
-    PANEL_RULE="tcp dport 2053 ip saddr @panel accept"
+    PANEL_RULE="tcp dport { 2053, 2096 } ip saddr @panel accept"
   fi
 fi
 tmp=$(mktemp)
@@ -755,7 +861,7 @@ EOF
   ok "Порт 443 открыт только для Yandex CDN ($(wc -l < /etc/cdn-lock/prefixes.txt) подсетей), список обновляется ежедневно"
 }
 
-# Записать IP NPM и убедиться, что nft пропускает 2053 с него
+# Записать IP NPM и убедиться, что nft пропускает 2053 и 2096 с него
 ensure_panel_allow() {
   local ip="$1" rules
   mkdir -p /etc/cdn-lock
@@ -765,19 +871,25 @@ ensure_panel_allow() {
   install_lock || return 1
   /usr/local/sbin/cdn-lock.sh || return 1
   rules=$(nft list chain inet cdnlock input 2>/dev/null || true)
-  if ! echo "$rules" | grep -qE "2053.*$ip|$ip.*2053|@panel"; then
-    err "nftables не пропускает 2053 для $ip. Сейчас правила:"
+  if ! echo "$rules" | grep -q '@panel'; then
+    err "nftables: нет set/правила @panel для $ip. Сейчас:"
     echo "$rules"
     return 1
   fi
-  ok "nftables: 2053 разрешён для $ip (до drop)"
+  if ! echo "$rules" | grep -qE '2053.*2096|2096.*2053'; then
+    err "nftables: нет accept для портов 2053/2096 с @panel. Сейчас:"
+    echo "$rules"
+    return 1
+  fi
+  ok "nftables: 2053 и 2096 разрешены для $ip (до drop)"
 }
 
 step_lock() {
   say "Закроем сервер от всех, кроме узлов Yandex CDN:"
   say "  • 443 — только с подсетей Yandex CDN, туннель отвечает только им;"
   say "  • 80 — только для продления сертификата, остальное соединение сбрасывается;"
-  say "  • панель (2053) и подписки (2096) закрыты, SSH не трогается."
+  say "  • панель (2053) и подписки (2096) закрыты для всех, кроме IP из panel-allow (если задан);"
+  say "  • SSH не трогается."
   yes_no "Включить?" y || { warn "Пропущено. Включить позже: bash $0 lock"; return 0; }
   install_lock || return 1
   sleep 3
@@ -801,14 +913,14 @@ step_unlock() {
 }
 
 step_panel_proxy() {
-  local ip path code panel_dom crt="/etc/letsencrypt/live/${CDN_DOMAIN}" conf="/etc/letsencrypt/renewal/${CDN_DOMAIN}.conf"
+  local ip path subp code panel_dom sub_uri crt="/etc/letsencrypt/live/${CDN_DOMAIN}" conf="/etc/letsencrypt/renewal/${CDN_DOMAIN}.conf"
   [[ -n "${CDN_DOMAIN:-}" ]] || { err "Не задан CDN_DOMAIN"; return 1; }
   [[ -f "$crt/fullchain.pem" ]] || { err "Нет сертификата $crt — сначала выполни полную настройку (шаг с certbot)"; return 1; }
   [[ -n "${SERVER_IP:-}" ]] || SERVER_IP=$(curl -4 -fsS --max-time 10 https://ifconfig.me)
 
-  say "Панель будет слушать ${c_b}0.0.0.0:${PANEL_PORT}${c_0} по ${c_b}HTTPS${c_0} (сертификат $CDN_DOMAIN)."
-  say "Снаружи порт ${PANEL_PORT} откроем только для IP Nginx Proxy Manager; остальным — drop."
-  ask_domain panel_dom "Домен панели в NPM (A → IP сервера с NPM)" "${PANEL_DOMAIN_PUBLIC:-3x-ui.iscreation.space}"
+  say "Панель ${c_b}${PANEL_PORT}${c_0} и подписки ${c_b}${SUB_PORT}${c_0} — HTTPS (сертификат $CDN_DOMAIN)."
+  say "Снаружи оба порта только для IP NPM. Подписки наружу — через ${c_b}443${c_0} того же домена (без :2096)."
+  ask_domain panel_dom "Домен панели/подписок в NPM (A → IP сервера с NPM)" "${PANEL_DOMAIN_PUBLIC:-3x-ui.iscreation.space}"
   PANEL_DOMAIN_PUBLIC=$panel_dom; save PANEL_DOMAIN_PUBLIC
   while true; do
     ask ip "Публичный IPv4 сервера с Nginx Proxy Manager" "$(head -n1 /etc/cdn-lock/panel-allow.txt 2>/dev/null)"
@@ -816,41 +928,63 @@ step_panel_proxy() {
     err "Некорректный IPv4: '$ip'"
   done
 
+  # -webCert также прописывает subCertFile/subKeyFile в 3x-ui
   /usr/local/x-ui/x-ui setting -listenIP 0.0.0.0 -port $PANEL_PORT \
     -webCert "$crt/fullchain.pem" -webCertKey "$crt/privkey.pem" >/dev/null || return 1
+
+  # subURI в 3x-ui = база + subPath + «/»; к ней только дописывается subId
+  # (если указать голый https://domain — получится https://domainSUBID без слэша и без path)
+  path=$(panel_path)
+  subp=$(xui_sub_path)
+  [[ -n "$subp" ]] || subp="sub"
+  sub_uri="https://${panel_dom}/${subp}/"
+  xui_set_setting subURI "$sub_uri" || warn "Не записал subURI — выставь вручную: $sub_uri"
+  xui_set_setting subDomain "$panel_dom" || true
+
   if [[ -f "$conf" ]]; then
     sed -i '/^renew_hook/d' "$conf"
     echo 'renew_hook = systemctl reload nginx; systemctl restart x-ui' >> "$conf"
   fi
   systemctl restart x-ui; sleep 3
 
-  # сначала IP в allow + nft (иначе NPM получит 504: 2053 дропается до accept)
+  # IP в allow + nft (иначе NPM получит 504: порты дропаются до accept)
   ensure_panel_allow "$ip" || return 1
 
-  path=$(panel_path)
   code=$(curl -sk -o /dev/null --max-time 8 -w '%{http_code}' "https://127.0.0.1:$PANEL_PORT/${path}/")
   [[ "$code" == 200 || "$code" == 302 || "$code" == 401 ]] \
     && ok "Панель по HTTPS локально отвечает ${code} на /${path}/" \
     || warn "Локально https://127.0.0.1:$PANEL_PORT/${path}/ → $code (проверь: journalctl -u x-ui -n 30)"
 
   ss -tlnp | grep -q ":$PANEL_PORT " && ok "Слушает порт $PANEL_PORT" || err "Порт $PANEL_PORT не слушается"
+  if ss -tlnp | grep -q ":$SUB_PORT "; then
+    ok "Слушает порт $SUB_PORT (подписки)"
+    code=$(curl -sk -o /dev/null --max-time 8 -w '%{http_code}' "https://127.0.0.1:$SUB_PORT/")
+    [[ "$code" != 000 ]] && ok "Подписки локально отвечают на HTTPS :$SUB_PORT (код $code)" \
+      || warn "Подписки на :$SUB_PORT не ответили — проверь subEnable/subCert в панели"
+  else
+    warn "Порт $SUB_PORT не слушается — включи Subscription в настройках 3x-ui"
+  fi
 
-  ok "Порт $PANEL_PORT открыт только для $ip (HTTPS)"
-  say "Проверка с NPM:  ${c_b}curl -vk --max-time 10 https://${SERVER_IP}:${PANEL_PORT}/${path}/${c_0}"
-  say "\n${c_b}Nginx Proxy Manager${c_0} → Hosts → Proxy Hosts → Edit:"
+  ok "Порты $PANEL_PORT и $SUB_PORT открыты только для $ip (HTTPS)"
+  ok "subURI = ${sub_uri}  (ссылки без :${SUB_PORT})"
+  say "Проверка панели с NPM:     ${c_b}curl -vk --max-time 10 https://${SERVER_IP}:${PANEL_PORT}/${path}/${c_0}"
+  say "Проверка подписок с NPM:  ${c_b}curl -vk --max-time 10 https://${SERVER_IP}:${SUB_PORT}/${subp}/${c_0}"
+
+  say "\n${c_b}Nginx Proxy Manager${c_0} → Hosts → Proxy Hosts → Edit ${panel_dom}:"
   say "  Details:"
   say "    Domain Names          = ${c_b}${panel_dom}${c_0}"
   say "    Scheme                = ${c_b}https${c_0}"
   say "    Forward Hostname / IP = ${c_b}${SERVER_IP}${c_0}"
-  say "    Forward Port          = ${c_b}${PANEL_PORT}${c_0}   ${c_y}(не 8443)${c_0}"
+  say "    Forward Port          = ${c_b}${PANEL_PORT}${c_0}   ${c_y}(панель; подписки — через location ниже)${c_0}"
   say "    Websockets Support    = вкл"
   say "    Block Common Exploits = вкл"
   say "  SSL:"
   say "    SSL Certificate = Request a new SSL Certificate (для ${panel_dom})"
   say "    Force SSL = вкл,  HTTP/2 = вкл"
-  say "  Advanced → Custom Nginx Configuration — вставь целиком:"
+  say "  Advanced → Custom Nginx Configuration — ${c_y}замени целиком${c_0} на:"
   cat <<EOF
 ${c_b}
+# панель → :${PANEL_PORT}
 proxy_ssl_server_name on;
 proxy_ssl_name ${CDN_DOMAIN};
 proxy_ssl_verify off;
@@ -858,10 +992,25 @@ proxy_set_header Host \$host;
 proxy_set_header X-Real-IP \$remote_addr;
 proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
 proxy_set_header X-Forwarded-Proto \$scheme;
+
+# подписки → :${SUB_PORT} (тот же домен, порт 443 снаружи — без Streams/:${SUB_PORT})
+location ^~ /${subp}/ {
+  proxy_pass https://${SERVER_IP}:${SUB_PORT};
+  proxy_ssl_server_name on;
+  proxy_ssl_name ${CDN_DOMAIN};
+  proxy_ssl_verify off;
+  proxy_set_header Host \$host;
+  proxy_set_header X-Real-IP \$remote_addr;
+  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto \$scheme;
+}
 ${c_0}
 EOF
+
   say "  DNS: A-запись ${c_b}${panel_dom}${c_0} → IP сервера с NPM (${ip})"
-  say "\nОткрывай: ${c_b}https://${panel_dom}/${path}/${c_0}"
+  say "\nПанель:     ${c_b}https://${panel_dom}/${path}/${c_0}"
+  say "Подписки:   ${c_b}https://${panel_dom}/${subp}/<subId>${c_0}   ${c_y}(без :${SUB_PORT})${c_0}"
+  say "Старые ссылки с :${SUB_PORT} больше не нужны — возьми новые из панели."
   say "Логин/пароль — из бэкапа / $PANEL_TXT"
 }
 
@@ -883,8 +1032,8 @@ step_finish() {
   echo; panel_tunnel_hint; say "Доступы: $PANEL_TXT"
   say  "Логи:   journalctl -u x-ui -f   |   tail -f /var/log/nginx/error.log"
   [[ "$SITE_MODE" == 2 ]] && say "Обновить сайт: запусти этот скрипт и повтори шаг 6 (или: cd /opt/site && git pull && docker compose up -d --build)"
-  say  "\nПереезд: на старом ${c_b}bash $0 backup${c_0} → scp архива на новый → там этот скрипт (указать бэкап) → в CDN сменить источник на новый IP."
-  say  "Бэкап сам определит Postgres или SQLite. DNS/CNAME/сертификат Яндекса трогать не нужно."
+  say  "\nПереезд: на старом ${c_b}bash cdn-vpn-export.sh${c_0} → scp архива на новый → там этот скрипт (указать бэкап) → в CDN сменить источник на новый IP."
+  say  "Экспорт забирает Postgres+SQLite+sub-theme. DNS/CNAME/сертификат Яндекса трогать не нужно."
 }
 
 # ---------------------------------------------------------------- main
@@ -897,7 +1046,7 @@ command -v dig >/dev/null || { apt-get update -qq && apt-get install -y -qq dnsu
 [[ -f "$STATE" ]] && . "$STATE"
 
 if [[ "${1:-}" == backup ]]; then
-  hdr B "Бэкап 3x-ui (Postgres / SQLite)"
+  hdr B "Бэкап 3x-ui (Postgres + SQLite + sub-theme)"
   step_backup
   exit
 fi
