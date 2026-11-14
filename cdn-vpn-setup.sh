@@ -151,12 +151,14 @@ xui_set_setting() {
   fi
 }
 
-xui_sub_path() { # путь подписок без слэшей
-  local p
-  p=$(xui_get_setting subPath 2>/dev/null || true)
+xui_norm_path() { # убрать ведущие/хвостовые слэши
+  local p="${1:-}"
   p="${p#/}"; p="${p%/}"
   printf '%s' "$p"
 }
+xui_sub_path() { xui_norm_path "$(xui_get_setting subPath 2>/dev/null || true)"; }
+xui_sub_json_path() { xui_norm_path "$(xui_get_setting subJsonPath 2>/dev/null || true)"; }
+xui_sub_clash_path() { xui_norm_path "$(xui_get_setting subClashPath 2>/dev/null || true)"; }
 
 xui_write_env() { # xui_write_env TYPE [DSN]
   umask 077
@@ -912,8 +914,27 @@ step_unlock() {
   ok "Ограничение снято: порты 80/443 открыты для всех. Включить снова: bash $0 lock"
 }
 
+# фрагмент location для одного пути подписок (sub / json / clash)
+npm_sub_location() {
+  local p="$1"
+  [[ -n "$p" ]] || return 0
+  cat <<EOF
+location ^~ /${p}/ {
+  proxy_pass https://${SERVER_IP}:${SUB_PORT};
+  proxy_ssl_server_name on;
+  proxy_ssl_name ${CDN_DOMAIN};
+  proxy_ssl_verify off;
+  proxy_set_header Host \$host;
+  proxy_set_header X-Real-IP \$remote_addr;
+  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto \$scheme;
+}
+EOF
+}
+
 step_panel_proxy() {
-  local ip path subp code panel_dom sub_uri crt="/etc/letsencrypt/live/${CDN_DOMAIN}" conf="/etc/letsencrypt/renewal/${CDN_DOMAIN}.conf"
+  local ip path subp jsonp clashp code panel_dom sub_uri json_uri clash_uri
+  local crt="/etc/letsencrypt/live/${CDN_DOMAIN}" conf="/etc/letsencrypt/renewal/${CDN_DOMAIN}.conf"
   [[ -n "${CDN_DOMAIN:-}" ]] || { err "Не задан CDN_DOMAIN"; return 1; }
   [[ -f "$crt/fullchain.pem" ]] || { err "Нет сертификата $crt — сначала выполни полную настройку (шаг с certbot)"; return 1; }
   [[ -n "${SERVER_IP:-}" ]] || SERVER_IP=$(curl -4 -fsS --max-time 10 https://ifconfig.me)
@@ -932,14 +953,22 @@ step_panel_proxy() {
   /usr/local/x-ui/x-ui setting -listenIP 0.0.0.0 -port $PANEL_PORT \
     -webCert "$crt/fullchain.pem" -webCertKey "$crt/privkey.pem" >/dev/null || return 1
 
-  # subURI в 3x-ui = база + subPath + «/»; к ней только дописывается subId
-  # (если указать голый https://domain — получится https://domainSUBID без слэша и без path)
+  # URI = https://domain/<path>/  (к ним дописывается только subId)
   path=$(panel_path)
-  subp=$(xui_sub_path)
-  [[ -n "$subp" ]] || subp="sub"
+  subp=$(xui_sub_path); [[ -n "$subp" ]] || subp="sub"
+  jsonp=$(xui_sub_json_path)
+  clashp=$(xui_sub_clash_path)
   sub_uri="https://${panel_dom}/${subp}/"
   xui_set_setting subURI "$sub_uri" || warn "Не записал subURI — выставь вручную: $sub_uri"
   xui_set_setting subDomain "$panel_dom" || true
+  if [[ -n "$jsonp" ]]; then
+    json_uri="https://${panel_dom}/${jsonp}/"
+    xui_set_setting subJsonURI "$json_uri" || true
+  fi
+  if [[ -n "$clashp" ]]; then
+    clash_uri="https://${panel_dom}/${clashp}/"
+    xui_set_setting subClashURI "$clash_uri" || true
+  fi
 
   if [[ -f "$conf" ]]; then
     sed -i '/^renew_hook/d' "$conf"
@@ -966,7 +995,9 @@ step_panel_proxy() {
   fi
 
   ok "Порты $PANEL_PORT и $SUB_PORT открыты только для $ip (HTTPS)"
-  ok "subURI = ${sub_uri}  (ссылки без :${SUB_PORT})"
+  ok "subURI = ${sub_uri}"
+  [[ -n "${json_uri:-}" ]] && ok "subJsonURI = ${json_uri}"
+  [[ -n "${clash_uri:-}" ]] && ok "subClashURI = ${clash_uri}"
   say "Проверка панели с NPM:     ${c_b}curl -vk --max-time 10 https://${SERVER_IP}:${PANEL_PORT}/${path}/${c_0}"
   say "Проверка подписок с NPM:  ${c_b}curl -vk --max-time 10 https://${SERVER_IP}:${SUB_PORT}/${subp}/${c_0}"
 
@@ -975,15 +1006,15 @@ step_panel_proxy() {
   say "    Domain Names          = ${c_b}${panel_dom}${c_0}"
   say "    Scheme                = ${c_b}https${c_0}"
   say "    Forward Hostname / IP = ${c_b}${SERVER_IP}${c_0}"
-  say "    Forward Port          = ${c_b}${PANEL_PORT}${c_0}   ${c_y}(панель; подписки — через location ниже)${c_0}"
+  say "    Forward Port          = ${c_b}${PANEL_PORT}${c_0}   ${c_y}(панель; sub/json/clash — через location ниже)${c_0}"
   say "    Websockets Support    = вкл"
   say "    Block Common Exploits = вкл"
   say "  SSL:"
   say "    SSL Certificate = Request a new SSL Certificate (для ${panel_dom})"
   say "    Force SSL = вкл,  HTTP/2 = вкл"
   say "  Advanced → Custom Nginx Configuration — ${c_y}замени целиком${c_0} на:"
+  echo -e "${c_b}"
   cat <<EOF
-${c_b}
 # панель → :${PANEL_PORT}
 proxy_ssl_server_name on;
 proxy_ssl_name ${CDN_DOMAIN};
@@ -993,23 +1024,18 @@ proxy_set_header X-Real-IP \$remote_addr;
 proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
 proxy_set_header X-Forwarded-Proto \$scheme;
 
-# подписки → :${SUB_PORT} (тот же домен, порт 443 снаружи — без Streams/:${SUB_PORT})
-location ^~ /${subp}/ {
-  proxy_pass https://${SERVER_IP}:${SUB_PORT};
-  proxy_ssl_server_name on;
-  proxy_ssl_name ${CDN_DOMAIN};
-  proxy_ssl_verify off;
-  proxy_set_header Host \$host;
-  proxy_set_header X-Real-IP \$remote_addr;
-  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-  proxy_set_header X-Forwarded-Proto \$scheme;
-}
-${c_0}
+# подписки / json / clash → :${SUB_PORT} (снаружи только 443)
 EOF
+  npm_sub_location "$subp"
+  npm_sub_location "$jsonp"
+  npm_sub_location "$clashp"
+  echo -e "${c_0}"
 
   say "  DNS: A-запись ${c_b}${panel_dom}${c_0} → IP сервера с NPM (${ip})"
   say "\nПанель:     ${c_b}https://${panel_dom}/${path}/${c_0}"
-  say "Подписки:   ${c_b}https://${panel_dom}/${subp}/<subId>${c_0}   ${c_y}(без :${SUB_PORT})${c_0}"
+  say "Sub:        ${c_b}https://${panel_dom}/${subp}/<subId>${c_0}"
+  [[ -n "$jsonp" ]] && say "JSON:       ${c_b}https://${panel_dom}/${jsonp}/<subId>${c_0}"
+  [[ -n "$clashp" ]] && say "Clash:      ${c_b}https://${panel_dom}/${clashp}/<subId>${c_0}"
   say "Старые ссылки с :${SUB_PORT} больше не нужны — возьми новые из панели."
   say "Логин/пароль — из бэкапа / $PANEL_TXT"
 }
