@@ -2,10 +2,11 @@
 # VLESS + XHTTP через Yandex Cloud CDN: nginx + certbot + 3x-ui (+ сайт на главной CDN-домена).
 # Схема: CDN-домен (CNAME на Yandex CDN) → источник — IP этого сервера. Остальной домен сервер не касается.
 # Запуск: bash cdn-vpn-setup.sh             — полная настройка нового сервера (под root, Ubuntu/Debian)
-#         bash cdn-vpn-setup.sh backup      — снять бэкап 3x-ui (Postgres или SQLite — авто)
+#         bash cdn-vpn-setup.sh backup      — бэкап 3x-ui на ЭТОМ сервере (Postgres+SQLite+sub-theme)
 #         bash cdn-vpn-setup.sh lock        — пустить на 443 только Yandex CDN
 #         bash cdn-vpn-setup.sh unlock      — снять это ограничение
 #         bash cdn-vpn-setup.sh panel-proxy — открыть панель (2053) и подписки (2096) только для внешнего reverse proxy (NPM)
+# Со старого сервера удобнее: bash cdn-vpn-export.sh (рядом в репозитории).
 # Ответы и прогресс сохраняются в /root/.cdn-vpn.env — скрипт можно прервать и запустить снова.
 
 set -u
@@ -186,60 +187,102 @@ xui_pg_prepare_db() { # создаёт роль/БД из PG_*
 }
 
 step_backup() {
+  # тот же формат, что cdn-vpn-export.sh
+  local self_dir export_sh
+  self_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+  export_sh="$self_dir/cdn-vpn-export.sh"
+  if [[ -f "$export_sh" ]]; then
+    bash "$export_sh" || return 1
+    return 0
+  fi
+  # fallback, если export-скрипт не рядом (скачали только setup)
+  warn "cdn-vpn-export.sh не найден рядом — встроенный бэкап"
   xui_load_env
-  local out="/root/3xui-backup-$(date +%F-%H%M).tar.gz" tmp
+  local out="/root/3xui-backup-$(date +%F-%H%M).tar.gz" tmp have_pg=0 have_sqlite=0
   tmp=$(mktemp -d); trap 'rm -rf "$tmp"' RETURN
-  mkdir -p "$tmp/meta"
-  if [[ -f /etc/default/x-ui ]]; then cp -a /etc/default/x-ui "$tmp/meta/x-ui.env"; fi
-  echo "db_type=$XUI_DB_TYPE" > "$tmp/meta/type.txt"
-  echo "created=$(date -Is)" >> "$tmp/meta/type.txt"
+  mkdir -p "$tmp/meta" "$tmp/db" "$tmp/etc/x-ui"
+  [[ -f /etc/default/x-ui ]] && cp -a /etc/default/x-ui "$tmp/meta/x-ui.env"
+  {
+    echo "format=cdn-vpn-export-v1"
+    echo "created=$(date -Is)"
+    echo "active_db=$XUI_DB_TYPE"
+  } > "$tmp/meta/type.txt"
 
   systemctl stop x-ui 2>/dev/null || true
-  if [[ "$XUI_DB_TYPE" == postgres ]]; then
-    xui_parse_dsn "${XUI_DB_DSN:-}" || { err "Не разобрать XUI_DB_DSN в /etc/default/x-ui"; systemctl start x-ui; return 1; }
-    command -v pg_dump >/dev/null || { apt-get install -y -qq postgresql-client >/dev/null; }
-    say "Снимаю Postgres-дамп ${PG_DB}@${PG_HOST} ..."
-    PGPASSWORD="$PG_PASS" pg_dump -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_DB" -Fc -f "$tmp/xui-pg.dump" \
-      || { err "pg_dump не удался"; systemctl start x-ui; return 1; }
-    local counts; counts=$(xui_pg_counts || true)
-    echo "counts_inbounds_users_clients=$counts" >> "$tmp/meta/type.txt"
-    say "В базе: inbounds/users/clients = ${counts:-(не удалось посчитать)}"
-    [[ "${counts%% *}" =~ ^[1-9] ]] || warn "Входящих 0 — на новом сервере после restore панель будет пустой"
-  else
-    command -v sqlite3 >/dev/null || DEBIAN_FRONTEND=noninteractive apt-get install -y -qq sqlite3 >/dev/null
-    [[ -f /etc/x-ui/x-ui.db ]] || { err "Нет /etc/x-ui/x-ui.db"; systemctl start x-ui; return 1; }
-    sqlite3 /etc/x-ui/x-ui.db "PRAGMA wal_checkpoint(TRUNCATE);" >/dev/null
-    local counts; counts=$(xui_sqlite_counts || true)
-    echo "counts_inbounds_users_clients=$counts" >> "$tmp/meta/type.txt"
-    say "В базе: inbounds/users/clients = ${counts:-(не удалось посчитать)}"
-    [[ "${counts%% *}" =~ ^[1-9] ]] || warn "Входящих 0 — если панель на Postgres, бэкапь через неё (XUI_DB_TYPE=postgres)"
-    mkdir -p "$tmp/etc"
-    cp -a /etc/x-ui "$tmp/etc/"
+  if [[ -n "${XUI_DB_DSN:-}" ]] && xui_parse_dsn "$XUI_DB_DSN"; then
+    command -v pg_dump >/dev/null || apt-get install -y -qq postgresql-client >/dev/null
+    if PGPASSWORD="$PG_PASS" pg_dump -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_DB" -Fc -f "$tmp/db/xui-pg.dump"; then
+      have_pg=1
+      cp -a "$tmp/db/xui-pg.dump" "$tmp/xui-pg.dump"
+      echo "postgres_counts_inbounds_users_clients=$(xui_pg_counts || true)" >> "$tmp/meta/type.txt"
+    fi
   fi
-  systemctl start x-ui
-
+  if [[ -f /etc/x-ui/x-ui.db ]]; then
+    command -v sqlite3 >/dev/null || DEBIAN_FRONTEND=noninteractive apt-get install -y -qq sqlite3 >/dev/null
+    sqlite3 /etc/x-ui/x-ui.db "PRAGMA wal_checkpoint(TRUNCATE);" >/dev/null 2>&1 || true
+    cp -a /etc/x-ui/x-ui.db "$tmp/db/x-ui.db"
+    cp -a /etc/x-ui/x-ui.db "$tmp/etc/x-ui/x-ui.db"
+    have_sqlite=1
+    echo "sqlite_counts_inbounds_users_clients=$(xui_sqlite_counts || true)" >> "$tmp/meta/type.txt"
+  fi
+  [[ -d /etc/x-ui/sub-theme ]] && cp -a /etc/x-ui/sub-theme "$tmp/etc/x-ui/"
+  echo "have_postgres=$have_pg" >> "$tmp/meta/type.txt"
+  echo "have_sqlite=$have_sqlite" >> "$tmp/meta/type.txt"
+  systemctl start x-ui 2>/dev/null || true
+  [[ $have_pg -eq 1 || $have_sqlite -eq 1 ]] || { err "Нет ни Postgres, ни SQLite для бэкапа"; return 1; }
   tar czf "$out" -C "$tmp" .
   chmod 600 "$out"
   ok "Бэкап: $out ($(du -h "$out" | awk '{print $1}'))"
-  say "Скачать к себе:  ${c_b}scp root@$(curl -4 -fsS --max-time 5 https://ifconfig.me 2>/dev/null || echo SERVER):$out .${c_0}"
-  say "На новый сервер: ${c_b}scp $(basename "$out") root@НОВЫЙ_IP:/root/${c_0}"
-  say "Там:              ${c_b}bash cdn-vpn-setup.sh${c_0} → на шаге 3x-ui укажи путь к этому архиву"
 }
 
 # определить тип файла бэкапа → postgres|sqlite|""
 xui_backup_kind() {
-  local f="$1"
+  local f="$1" list active
   case "$f" in
     *.dump|*.sql) echo postgres; return ;;
     *.db) echo sqlite; return ;;
   esac
-  if tar tzf "$f" 2>/dev/null | grep -qE '(^|/)xui-pg\.dump$'; then echo postgres; return; fi
-  if tar tzf "$f" 2>/dev/null | grep -qE '(^|/)x-ui\.db$'; then echo sqlite; return; fi
+  list=$(tar tzf "$f" 2>/dev/null || true)
+  active=$(tar xzf "$f" -O meta/type.txt 2>/dev/null | sed -n 's/^active_db=//p' | head -n1)
+  if [[ "$active" == postgres ]] && echo "$list" | grep -qE '(^|/)xui-pg\.dump$'; then echo postgres; return; fi
+  if [[ "$active" == sqlite ]] && echo "$list" | grep -qE '(^|/)x-ui\.db$'; then echo sqlite; return; fi
+  # обе базы в архиве — предпочитаем Postgres (как на проде с XUI_DB_TYPE=postgres)
+  if echo "$list" | grep -qE '(^|/)xui-pg\.dump$'; then echo postgres; return; fi
+  if echo "$list" | grep -qE '(^|/)x-ui\.db$'; then echo sqlite; return; fi
   echo ""
 }
 
+# восстановить sub-theme и прочие файлы из распакованного tmp
+xui_restore_files_from_tmp() {
+  local tmp="$1"
+  mkdir -p /etc/x-ui
+  if [[ -d "$tmp/etc/x-ui/sub-theme" ]]; then
+    rm -rf /etc/x-ui/sub-theme
+    cp -a "$tmp/etc/x-ui/sub-theme" /etc/x-ui/
+    ok "Восстановлен /etc/x-ui/sub-theme"
+  elif [[ -d "$tmp/sub-theme" ]]; then
+    rm -rf /etc/x-ui/sub-theme
+    cp -a "$tmp/sub-theme" /etc/x-ui/
+    ok "Восстановлен /etc/x-ui/sub-theme"
+  else
+    warn "В архиве нет sub-theme — пропуск"
+  fi
+  # прочие файлы панели (кроме db)
+  if [[ -d "$tmp/etc/x-ui" ]]; then
+    local f rel
+    while IFS= read -r -d '' f; do
+      rel="${f#$tmp/etc/x-ui/}"
+      case "$rel" in
+        x-ui.db|x-ui.db-wal|x-ui.db-shm|sub-theme|sub-theme/*) continue ;;
+      esac
+      mkdir -p "/etc/x-ui/$(dirname "$rel")"
+      cp -a "$f" "/etc/x-ui/$rel"
+    done < <(find "$tmp/etc/x-ui" -mindepth 1 \( -type f -o -type l \) ! -name 'x-ui.db*' -print0 2>/dev/null)
+  fi
+}
+
 xui_restore_postgres() {
-  local bk="$1" dump="$bk" envf="" tmp
+  local bk="$1" dump="$bk" envf="" tmp="" sqlite_side=""
   command -v pg_restore >/dev/null || xui_ensure_postgres || return 1
   xui_ensure_postgres || return 1
 
@@ -248,7 +291,9 @@ xui_restore_postgres() {
     tar xzf "$bk" -C "$tmp" || { rm -rf "$tmp"; return 1; }
     dump=$(find "$tmp" -name 'xui-pg.dump' | head -n1)
     envf=$(find "$tmp" -name 'x-ui.env' | head -n1)
+    sqlite_side=$(find "$tmp" -name 'x-ui.db' | head -n1)
     [[ -n "$dump" ]] || { err "В архиве нет xui-pg.dump"; rm -rf "$tmp"; return 1; }
+    xui_restore_files_from_tmp "$tmp"
   fi
 
   if [[ -n "$envf" ]]; then
@@ -279,6 +324,12 @@ xui_restore_postgres() {
     --no-owner --clean --if-exists "$dump" >/tmp/xui-pg-restore.log 2>&1 \
     || warn "pg_restore завершился с предупреждениями (часто нормально) — смотри /tmp/xui-pg-restore.log"
 
+  # SQLite из того же архива — на диск (панель всё равно на Postgres)
+  if [[ -n "$sqlite_side" ]]; then
+    install -D -m 600 "$sqlite_side" /etc/x-ui/x-ui.db
+    ok "SQLite из архива положен в /etc/x-ui/x-ui.db (активен Postgres)"
+  fi
+
   xui_write_env postgres "$XUI_DB_DSN"
   local counts; counts=$(xui_pg_counts || echo "0 0 0")
   say "После restore: inbounds/users/clients = $counts"
@@ -289,19 +340,25 @@ xui_restore_postgres() {
 }
 
 xui_restore_sqlite() {
-  local bk="$1"
+  local bk="$1" tmp=""
   command -v sqlite3 >/dev/null || DEBIAN_FRONTEND=noninteractive apt-get install -y -qq sqlite3 >/dev/null
   rm -f /etc/x-ui/x-ui.db /etc/x-ui/x-ui.db-wal /etc/x-ui/x-ui.db-shm
   if [[ "$bk" == *.db ]]; then
     install -D -m 600 "$bk" /etc/x-ui/x-ui.db || return 1
   else
-    local tmp; tmp=$(mktemp -d)
+    tmp=$(mktemp -d)
     tar xzf "$bk" -C "$tmp" || { rm -rf "$tmp"; return 1; }
-    if [[ -d "$tmp/etc/x-ui" ]]; then cp -a "$tmp/etc/x-ui/." /etc/x-ui/
+    xui_restore_files_from_tmp "$tmp"
+    if [[ -f "$tmp/db/x-ui.db" ]]; then install -D -m 600 "$tmp/db/x-ui.db" /etc/x-ui/x-ui.db
+    elif [[ -f "$tmp/etc/x-ui/x-ui.db" ]]; then install -D -m 600 "$tmp/etc/x-ui/x-ui.db" /etc/x-ui/x-ui.db
     elif [[ -f "$tmp/x-ui.db" ]]; then install -D -m 600 "$tmp/x-ui.db" /etc/x-ui/x-ui.db
+    elif [[ -d "$tmp/etc/x-ui" ]]; then cp -a "$tmp/etc/x-ui/." /etc/x-ui/
     else
-      # старый формат: etc/x-ui в корне архива относительно /
-      tar xzf "$bk" -C / etc/x-ui 2>/dev/null || { err "В архиве нет etc/x-ui"; rm -rf "$tmp"; return 1; }
+      tar xzf "$bk" -C / etc/x-ui 2>/dev/null || { err "В архиве нет x-ui.db"; rm -rf "$tmp"; return 1; }
+    fi
+    # если в архиве ещё и Postgres — восстановим его тоже, но активным оставим sqlite (active_db)
+    if [[ -f "$tmp/db/xui-pg.dump" || -f "$tmp/xui-pg.dump" ]]; then
+      warn "В архиве есть и Postgres-дамп; активный движок — SQLite (как в meta). Postgres можно поднять отдельно."
     fi
     rm -rf "$tmp"
   fi
@@ -314,7 +371,7 @@ xui_restore_sqlite() {
   local counts; counts=$(xui_sqlite_counts || echo "0 0 0")
   say "После restore: inbounds/users/clients = $counts"
   if [[ ! "${counts%% *}" =~ ^[1-9] ]]; then
-    err "В SQLite 0 входящих. Если на старом сервере был Postgres — снимай бэкап так: bash $0 backup"
+    err "В SQLite 0 входящих. Если на старом сервере был Postgres — снимай: bash cdn-vpn-export.sh"
     return 1
   fi
   ok "SQLite восстановлен"
@@ -579,16 +636,16 @@ step_xui() {
     [[ -f "$f" ]] && { bk=$f; break; }
   done
   say "Бэкап 3x-ui со старого сервера (если переезд):"
-  say "  • Postgres: архив от ${c_b}bash $0 backup${c_0} или файл ${c_b}xui-pg.dump${c_0}"
-  say "  • SQLite:   архив с etc/x-ui или файл x-ui.db"
+  say "  На старом: ${c_b}bash cdn-vpn-export.sh${c_0}  (Postgres + SQLite + /etc/x-ui/sub-theme)"
+  say "  Или здесь: ${c_b}bash $0 backup${c_0}"
   say "Залей на этот сервер: scp бэкап root@${SERVER_IP}:/root/"
   ask bk "Путь к бэкапу (- или пусто — чистая установка)" "$bk"
   [[ "$bk" == - ]] && bk=""
   [[ -z "$bk" || -f "$bk" ]] || { err "Нет файла $bk"; return 1; }
   if [[ -n "$bk" ]]; then
     kind=$(xui_backup_kind "$bk")
-    [[ -n "$kind" ]] || { err "Не понял тип бэкапа ($bk). Нужен xui-pg.dump / *.db / архив от «$0 backup»"; return 1; }
-    say "Тип бэкапа: ${c_b}$kind${c_0}"
+    [[ -n "$kind" ]] || { err "Не понял тип бэкапа ($bk). Нужен архив от cdn-vpn-export.sh / $0 backup"; return 1; }
+    say "Тип бэкапа (активная БД): ${c_b}$kind${c_0}  — восстановятся БД, sub-theme и файлы панели"
   fi
 
   if [[ -f $PANEL_TXT ]]; then
@@ -975,8 +1032,8 @@ step_finish() {
   echo; panel_tunnel_hint; say "Доступы: $PANEL_TXT"
   say  "Логи:   journalctl -u x-ui -f   |   tail -f /var/log/nginx/error.log"
   [[ "$SITE_MODE" == 2 ]] && say "Обновить сайт: запусти этот скрипт и повтори шаг 6 (или: cd /opt/site && git pull && docker compose up -d --build)"
-  say  "\nПереезд: на старом ${c_b}bash $0 backup${c_0} → scp архива на новый → там этот скрипт (указать бэкап) → в CDN сменить источник на новый IP."
-  say  "Бэкап сам определит Postgres или SQLite. DNS/CNAME/сертификат Яндекса трогать не нужно."
+  say  "\nПереезд: на старом ${c_b}bash cdn-vpn-export.sh${c_0} → scp архива на новый → там этот скрипт (указать бэкап) → в CDN сменить источник на новый IP."
+  say  "Экспорт забирает Postgres+SQLite+sub-theme. DNS/CNAME/сертификат Яндекса трогать не нужно."
 }
 
 # ---------------------------------------------------------------- main
@@ -989,7 +1046,7 @@ command -v dig >/dev/null || { apt-get update -qq && apt-get install -y -qq dnsu
 [[ -f "$STATE" ]] && . "$STATE"
 
 if [[ "${1:-}" == backup ]]; then
-  hdr B "Бэкап 3x-ui (Postgres / SQLite)"
+  hdr B "Бэкап 3x-ui (Postgres + SQLite + sub-theme)"
   step_backup
   exit
 fi
