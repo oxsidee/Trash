@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # OmniRoute выходит в сеть с отдельного адреса (по умолчанию 192.168.1.222).
-# Сервер остаётся на своём адресе. Панель :20128 не переносится.
+# Интерфейс берётся у текущего шлюза сервера. Панель :20128 не переносится.
 # Запуск на сервере с контейнером, от root:
 #   bash omniroute-egress.sh /путь/docker-compose.yaml
 #   bash omniroute-egress.sh down
@@ -12,12 +12,9 @@ SBIN=/usr/local/sbin/omniroute-egress.sh
 UNIT_IP=/etc/systemd/system/omniroute-egress-ip.service
 UNIT_SNAT=/etc/systemd/system/omniroute-egress.service
 
-user_host=${HOST_IP-}
 user_egress=${EGRESS_IP-}
 [[ -f "$ENV_FILE" ]] && source "$ENV_FILE"
-[[ -n "$user_host" ]] && HOST_IP=$user_host
 [[ -n "$user_egress" ]] && EGRESS_IP=$user_egress
-: "${HOST_IP:=192.168.1.22}"
 : "${EGRESS_IP:=192.168.1.222}"
 : "${COMPOSE_FILE:=}"
 : "${PROJECT:=}"
@@ -33,23 +30,28 @@ err()  { echo -e "${c_r}✗ $*${c_0}" >&2; }
 valid_ip() { [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; }
 
 find_iface() {
+  local best
   IFACE=""
+  GATEWAY=""
   IFACE_HOW=""
-  local line cidr dev
-  while read -r line; do
-    dev=$(awk '{print $2}' <<<"$line")
-    cidr=$(awk '{print $4}' <<<"$line")
-    [[ "$cidr" == "$HOST_IP/"* ]] || continue
-    IFACE=$dev
-    IFACE_HOW="адрес $HOST_IP"
-    return 0
-  done < <(ip -4 -o addr show)
-  IFACE=$(ip -4 route show default | awk -v gw="$HOST_IP" '$1=="default" && $3==gw {print $5; exit}')
-  if [[ -n "$IFACE" ]]; then
-    IFACE_HOW="шлюз $HOST_IP"
-    return 0
-  fi
-  return 1
+  best=$(ip -4 route show default | awk '
+    $1 == "default" && $2 == "via" {
+      gw = $3
+      dev = $5
+      metric = 0
+      for (i = 1; i <= NF; i++) if ($i == "metric") metric = $(i + 1)
+      if (chosen == "" || metric + 0 < bestm) {
+        chosen = gw " " dev
+        bestm = metric + 0
+      }
+    }
+    END { if (chosen != "") print chosen }
+  ')
+  [[ -n "$best" ]] || return 1
+  GATEWAY=${best%% *}
+  IFACE=${best##* }
+  [[ -n "$GATEWAY" && -n "$IFACE" ]] || return 1
+  IFACE_HOW="шлюз $GATEWAY"
 }
 
 add_ip() {
@@ -58,7 +60,7 @@ add_ip() {
     find_iface && break
     sleep 1
   done
-  find_iface || { err "нет интерфейса с адресом или шлюзом $HOST_IP"; ip -4 addr; ip -4 route; return 1; }
+  find_iface || { err "нет маршрута по умолчанию"; ip -4 route; return 1; }
   if ! ip -4 -o addr show dev "$IFACE" | awk '{print $4}' | grep -q "^${EGRESS_IP}/"; then
     if command -v arping >/dev/null 2>&1; then
       local out
@@ -70,10 +72,7 @@ add_ip() {
     fi
   fi
   ip addr replace "${EGRESS_IP}/32" dev "$IFACE"
-  local gw probe
-  gw=$(ip -4 route show default | awk '{print $3; exit}')
-  probe=${gw:-$HOST_IP}
-  if ! ip route get "$probe" from "$EGRESS_IP" >/dev/null 2>&1; then
+  if ! ip route get "$GATEWAY" from "$EGRESS_IP" >/dev/null 2>&1; then
     err "ядро не принимает источник $EGRESS_IP на $IFACE"
     return 1
   fi
@@ -95,8 +94,8 @@ persist_nm() {
 
 write_env() {
   umask 022
-  printf 'HOST_IP=%q\nEGRESS_IP=%q\nCOMPOSE_FILE=%q\nPROJECT=%q\nLAST_BAK=%q\nNET_NAME=%q\nIFACE=%q\n' \
-    "$HOST_IP" "$EGRESS_IP" "$COMPOSE_FILE" "$PROJECT" "$LAST_BAK" "$NET_NAME" "${IFACE:-}" > "$ENV_FILE"
+  printf 'EGRESS_IP=%q\nCOMPOSE_FILE=%q\nPROJECT=%q\nLAST_BAK=%q\nNET_NAME=%q\n' \
+    "$EGRESS_IP" "$COMPOSE_FILE" "$PROJECT" "$LAST_BAK" "$NET_NAME" > "$ENV_FILE"
   chmod 644 "$ENV_FILE"
 }
 
@@ -371,8 +370,7 @@ verify_egress() {
 
 cmd_install() {
   [[ $EUID -eq 0 ]] || { err "запусти от root"; exit 1; }
-  valid_ip "$HOST_IP" && valid_ip "$EGRESS_IP" || { err "некорректный IP"; exit 1; }
-  [[ "$HOST_IP" != "$EGRESS_IP" ]] || { err "HOST_IP и EGRESS_IP совпадают"; exit 1; }
+  valid_ip "$EGRESS_IP" || { err "некорректный IP $EGRESS_IP"; exit 1; }
   command -v docker >/dev/null 2>&1 || { err "нет docker"; exit 1; }
   command -v python3 >/dev/null 2>&1 || { err "нужен python3"; exit 1; }
   [[ -f "$COMPOSE_FILE" ]] || { err "нет файла compose: $COMPOSE_FILE"; exit 1; }
@@ -474,7 +472,8 @@ cmd_down() {
     err "нет бэкапа compose, адрес $EGRESS_IP не снимаю — иначе контейнер потеряет маршрут"
     return 1
   fi
-  if [[ -z "${IFACE:-}" ]]; then find_iface || true; fi
+  IFACE=""
+  find_iface || true
   if [[ -n "${IFACE:-}" ]]; then
     ip addr del "${EGRESS_IP}/32" dev "$IFACE" 2>/dev/null || true
     if command -v nmcli >/dev/null 2>&1; then
