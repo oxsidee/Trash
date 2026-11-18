@@ -585,10 +585,11 @@ def _shutdown(pool: ThreadPoolExecutor, wait_for: bool, cancel: bool) -> None:
     pool.shutdown(wait=wait_for)
 
 
-def scan(nets: list[ipaddress.IPv4Network], total: int) -> int:
+def scan(nets: list[ipaddress.IPv4Network], total: int) -> list[tuple[str, int]]:
     pending: set = set()
     checked = 0
     found = 0
+    hits: list[tuple[str, int]] = []
     mark = 0
     started = time.monotonic()
     pool = ThreadPoolExecutor(max_workers=WORKERS, thread_name_prefix="yccdn")
@@ -612,6 +613,7 @@ def scan(nets: list[ipaddress.IPv4Network], total: int) -> int:
                 if hit is not None:
                     ip, ms = hit
                     found += 1
+                    hits.append((ip, ms))
                     _show_hit(ip, ms)
                     out.write(f"{ip} {ms}ms\n")
                     out.flush()
@@ -625,11 +627,11 @@ def scan(nets: list[ipaddress.IPv4Network], total: int) -> int:
                     _progress(checked, total, found, started, stay=True)
         if checked % PROGRESS_EVERY:
             _progress(checked, total, found, started, stay=False)
-        return found
+        return hits
     except KeyboardInterrupt:
         interrupted = True
         print(f"\nпрервано на {checked}/{total}, найдено {found}", flush=True)
-        return found
+        return hits
     finally:
         try:
             out.flush()
@@ -660,19 +662,219 @@ def _progress(checked: int, total: int, found: int, started: float, *, stay: boo
         print(f"\r\033[K{text}", flush=True)
 
 
+def _env_file(path: str) -> dict[str, str]:
+    found: dict[str, str] = {}
+    try:
+        handle = open(path, encoding="utf-8")
+    except OSError:
+        return found
+    with handle:
+        for line in handle:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            value = value.strip().strip("'\"")
+            found[key.strip()] = value
+    return found
+
+
+def edge_config() -> tuple[str, str] | None:
+    file_vars: dict[str, str] = {}
+    for path in (
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "cdn-edge.env"),
+        "cdn-edge.env",
+    ):
+        file_vars.update(_env_file(path))
+    url = os.environ.get("CDN_EDGE_URL", file_vars.get("CDN_EDGE_URL", "")).strip()
+    token = os.environ.get("CDN_EDGE_TOKEN", file_vars.get("CDN_EDGE_TOKEN", "")).strip()
+    if not url or not token:
+        return None
+    return url, token
+
+
+def known_edge_ips() -> list[str]:
+    ips: list[str] = []
+    try:
+        lines = open(OUT_PATH, encoding="utf-8")
+    except OSError:
+        return ips
+    with lines:
+        for line in lines:
+            part = line.split()
+            if part and is_public_ipv4(part[0]) and part[0] not in ips:
+                ips.append(part[0])
+    return ips
+
+
+def is_public_ipv4(value: str) -> bool:
+    try:
+        addr = ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    return addr.version == 4 and addr.is_global
+
+
+def choose_edge(addresses: list[str], hits: list[tuple[str, int]]) -> str | None:
+    """IP с минимальной задержкой, либо None если текущие адреса и так среди живых."""
+    if not hits:
+        return None
+    found = {ip for ip, _ms in hits}
+    if addresses and all(is_public_ipv4(item) and item in found for item in addresses):
+        return None
+    return min(hits, key=lambda item: (item[1], item[0]))[0]
+
+
+def _read_http(tls: ssl.SSLSocket) -> tuple[int, dict]:
+    data = b""
+    while b"\r\n\r\n" not in data and len(data) < 65536:
+        chunk = tls.recv(4096)
+        if not chunk:
+            break
+        data += chunk
+    head, _, rest = data.partition(b"\r\n\r\n")
+    line = head.split(b"\r\n", 1)[0].decode("iso-8859-1", "replace")
+    parts = line.split()
+    if len(parts) < 2 or not parts[0].startswith("HTTP/"):
+        raise OSError("нет статуса API")
+    status = int(parts[1])
+    headers = {}
+    for raw in head.split(b"\r\n")[1:]:
+        if b":" in raw:
+            key, value = raw.split(b":", 1)
+            headers[key.decode().lower()] = value.strip().decode()
+    body = rest
+    if headers.get("transfer-encoding", "").lower() == "chunked":
+        raise OSError("chunked")
+    need = int(headers.get("content-length", str(len(body))) or "0")
+    while len(body) < need:
+        chunk = tls.recv(need - len(body))
+        if not chunk:
+            break
+        body += chunk
+    if not body:
+        return status, {}
+    payload = json.loads(body.decode("utf-8"))
+    if not isinstance(payload, dict):
+        raise OSError("ответ API не объект")
+    return status, payload
+
+
+def edge_exchange(
+    url: str,
+    token: str,
+    method: str,
+    via: str | None = None,
+    payload: dict | None = None,
+    timeout: float = 20,
+) -> dict:
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme != "https" or not parsed.hostname:
+        raise ValueError(url)
+    path = parsed.path or "/"
+    query = parsed.query
+    if method == "GET":
+        stamp = f"t={int(time.time() * 1000)}"
+        query = f"{query}&{stamp}" if query else stamp
+    if query:
+        path = f"{path}?{query}"
+    ip = via or resolve_host(parsed.hostname)
+    raw = socket.create_connection((ip, parsed.port or 443), timeout)
+    tls: ssl.SSLSocket | None = None
+    try:
+        tls = ssl.create_default_context().wrap_socket(raw, server_hostname=parsed.hostname)
+        tls.settimeout(timeout)
+        body = b""
+        extra = ""
+        if payload is not None:
+            body = json.dumps(payload).encode()
+            extra = f"Content-Type: application/json\r\nContent-Length: {len(body)}\r\n"
+        request = (
+            f"{method} {path} HTTP/1.1\r\n"
+            f"Host: {parsed.hostname}\r\n"
+            f"X-Edge-Token: {token}\r\n"
+            f"Authorization: Bearer {token}\r\n"
+            f"Accept: application/json\r\n"
+            f"{extra}"
+            "Connection: close\r\n\r\n"
+        ).encode() + body
+        tls.sendall(request)
+        status, data = _read_http(tls)
+    finally:
+        try:
+            (tls or raw).close()
+        except OSError:
+            pass
+    if status != 200:
+        raise OSError(data.get("error") or f"HTTP {status}")
+    return data
+
+
+def edge_get(url: str, token: str, vias: list[str]) -> tuple[bool, list[str]]:
+    attempts: list[str | None] = [None, *vias[:5]]
+    last = "нет маршрута"
+    for via in attempts:
+        try:
+            data = edge_exchange(url, token, "GET", via)
+        except Exception as exc:
+            last = str(exc)
+            continue
+        addresses = [str(item) for item in data.get("addresses") or [] if str(item)]
+        where = via or "DNS"
+        print(f"3x-ui сейчас: {', '.join(addresses) or 'пусто'} (через {where})", flush=True)
+        return True, addresses
+    print(f"текущий адрес 3x-ui не прочитан ({last})", flush=True)
+    return False, []
+
+
+def edge_apply(url: str, token: str, hits: list[tuple[str, int]]) -> None:
+    if not hits:
+        print("живых IP нет, 3x-ui не меняю", flush=True)
+        return
+    vias = [ip for ip, _ms in sorted(hits, key=lambda item: item[1])]
+    ok, addresses = edge_get(url, token, vias)
+    if not ok:
+        print("сервер не ответил, 3x-ui не меняю", flush=True)
+        return
+    chosen = choose_edge(addresses, hits)
+    if chosen is None:
+        print(f"текущий IP уже среди живых, не меняю", flush=True)
+        return
+    try:
+        result = edge_exchange(url, token, "POST", chosen, {"address": chosen})
+    except Exception as exc:
+        print(f"не записал {chosen}: {exc}", flush=True)
+        return
+    ms = next(ms for ip, ms in hits if ip == chosen)
+    line = f"3x-ui → {chosen} {ms}ms"
+    if os.isatty(1):
+        print(f"\033[1;32m{line}\033[0m", flush=True)
+    else:
+        print(line, flush=True)
+    if not result.get("restarted", True):
+        print("база записана, но x-ui не перезапустился", flush=True)
+
+
 def main() -> None:
     raise_nofile()
     print(
         f"{DOMAIN}:443, потоков {WORKERS}, TCP-таймаут {CONNECT_TIMEOUT} с",
         flush=True,
     )
+    cfg = edge_config()
+    if cfg is None:
+        print("CDN_EDGE_URL и CDN_EDGE_TOKEN не заданы, сервер не меняю", flush=True)
+    else:
+        edge_get(cfg[0], cfg[1], known_edge_ips())
     nets = collect_networks()
     total = sum(host_count(net) for net in nets)
     print(f"к сканированию: {len(nets)} подсетей, {total} адресов", flush=True)
     if total <= 0:
         raise SystemExit("нет адресов для сканирования")
-    found = scan(nets, total)
-    print(f"готово, найдено {found}. Файл: {OUT_PATH}", flush=True)
+    hits = scan(nets, total)
+    print(f"готово, найдено {len(hits)}. Файл: {OUT_PATH}", flush=True)
+    if cfg is not None:
+        edge_apply(cfg[0], cfg[1], hits)
 
 
 if __name__ == "__main__":
