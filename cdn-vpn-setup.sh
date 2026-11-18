@@ -9,6 +9,7 @@
 #         bash cdn-vpn-setup.sh rotate      — авторотация CDN-доменов (hosts + downloadSettings), без ввода
 #         bash cdn-vpn-setup.sh rotate 10   — то же, uplink=cdn10 / download=cdn11
 #         bash cdn-vpn-setup.sh ensure-split — только восстановить downloadSettings (разделение потоков)
+#         bash cdn-vpn-setup.sh show-split   — показать downloadSettings из БД (не из config.json)
 # Со старого сервера удобнее: bash cdn-vpn-export.sh (рядом в репозитории).
 # Ответы и прогресс сохраняются в /root/.cdn-vpn.env — скрипт можно прервать и запустить снова.
 
@@ -201,8 +202,10 @@ step_backup() {
   # fallback, если export-скрипт не рядом (скачали только setup)
   warn "cdn-vpn-export.sh не найден рядом — встроенный бэкап"
   xui_load_env
-  local out="/root/3xui-backup-$(date +%F-%H%M).tar.gz" tmp have_pg=0 have_sqlite=0
-  tmp=$(mktemp -d); trap 'rm -rf "$tmp"' RETURN
+  local out="/root/3xui-backup-$(date +%F-%H%M).tar.gz" have_pg=0 have_sqlite=0
+  # не используем trap RETURN + local tmp: при set -u это даёт «tmp: unbound variable»
+  local tmp
+  tmp=$(mktemp -d) || return 1
   mkdir -p "$tmp/meta" "$tmp/db" "$tmp/etc/x-ui"
   [[ -f /etc/default/x-ui ]] && cp -a /etc/default/x-ui "$tmp/meta/x-ui.env"
   {
@@ -232,8 +235,13 @@ step_backup() {
   echo "have_postgres=$have_pg" >> "$tmp/meta/type.txt"
   echo "have_sqlite=$have_sqlite" >> "$tmp/meta/type.txt"
   systemctl start x-ui 2>/dev/null || true
-  [[ $have_pg -eq 1 || $have_sqlite -eq 1 ]] || { err "Нет ни Postgres, ни SQLite для бэкапа"; return 1; }
+  if [[ $have_pg -eq 0 && $have_sqlite -eq 0 ]]; then
+    rm -rf "$tmp"
+    err "Нет ни Postgres, ни SQLite для бэкапа"
+    return 1
+  fi
   tar czf "$out" -C "$tmp" .
+  rm -rf "$tmp"
   chmod 600 "$out"
   ok "Бэкап: $out ($(du -h "$out" | awk '{print $1}'))"
 }
@@ -1083,6 +1091,10 @@ step_rotate() {
 
   cdn_zone_from_domain "${CDN_DOMAIN:-}"
   export CDN_PREFIX CDN_ZONE
+  if [[ "$mode" == show-split ]]; then
+    python3 "$rotate_py" --show-split
+    return
+  fi
   if [[ "$mode" == ensure-split ]]; then
     say "Восстановление разделения потоков: ${c_b}xhttpSettings.downloadSettings${c_0}"
     args+=(--ensure-split)
@@ -1093,10 +1105,13 @@ step_rotate() {
     && args+=(--start "$start") \
     || { [[ -z "$start" ]] || { err "Номер uplink — целое >= 1, получено: '$start'"; return 1; }; }
 
-  say "Страховочный бэкап..."
-  step_backup >/tmp/cdn-rotate-backup.log 2>&1 \
-    && ok "Бэкап снят (см. /tmp/cdn-rotate-backup.log)" \
-    || warn "Бэкап не удался — продолжаю (лог /tmp/cdn-rotate-backup.log)"
+  # лёгкий бэкап только для rotate (ensure-split — быстрый, без полного архива)
+  if [[ "$mode" != ensure-split ]]; then
+    say "Страховочный бэкап..."
+    step_backup >/tmp/cdn-rotate-backup.log 2>&1 \
+      && ok "Бэкап снят (см. /tmp/cdn-rotate-backup.log)" \
+      || warn "Бэкап не удался — продолжаю (лог /tmp/cdn-rotate-backup.log)"
+  fi
 
   python3 "$rotate_py" "${args[@]}" || return 1
 
@@ -1104,14 +1119,28 @@ step_rotate() {
   sleep 2
   systemctl is-active --quiet x-ui && ok "x-ui перезапущен" || warn "x-ui не активен — journalctl -u x-ui -n 30"
 
+  # после рестарта: только БД (в config.json / UI Advanced блока нет — x-ui вырезает его при сборке Xray)
+  say "Проверка БД после рестарта x-ui:"
+  if ! python3 "$rotate_py" --show-split; then
+    warn "После рестарта downloadSettings пропал из БД — записываю снова"
+    python3 "$rotate_py" "${args[@]}" || return 1
+    systemctl restart x-ui 2>/dev/null || true
+    sleep 2
+    python3 "$rotate_py" --show-split || {
+      err "downloadSettings снова нет в БД после повторной записи"
+      return 1
+    }
+  fi
+
   if [[ "$mode" != ensure-split ]]; then
     say "\nДальше вручную в Yandex Cloud / DNS:"
     say "  • выпусти/привяжи сертификат и CDN-ресурс на новый uplink/download;"
     say "  • CNAME ${c_b}${CDN_PREFIX}N.${CDN_ZONE}${c_0} → технический домен CDN;"
     say "  • клиенты подтянут новые домены после обновления подписки."
   fi
-  say "Не открывай inbound в UI и не жми Save — панель может вырезать downloadSettings из JSON."
-  say "Команды: ${c_b}bash $0 rotate${c_0}  |  ${c_b}bash $0 ensure-split${c_0}"
+  say "Где смотреть: ${c_b}bash $0 show-split${c_0}  (БД). В ${c_y}config.json / UI Advanced${c_0} блока не будет — так и должно быть."
+  say "Не жми Save на inbound в UI — панель вырежет downloadSettings."
+  say "Команды: ${c_b}bash $0 rotate${c_0}  |  ${c_b}bash $0 ensure-split${c_0}  |  ${c_b}bash $0 show-split${c_0}"
 }
 
 step_finish() {
@@ -1153,6 +1182,12 @@ fi
 if [[ "${1:-}" == ensure-split ]]; then
   hdr R "Восстановление downloadSettings (разделение потоков)"
   step_rotate "${2:-}" ensure-split
+  exit
+fi
+
+if [[ "${1:-}" == show-split ]]; then
+  hdr R "downloadSettings в БД"
+  step_rotate "" show-split
   exit
 fi
 

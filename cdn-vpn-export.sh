@@ -17,7 +17,8 @@ err()  { echo -e "${c_r}✗ $*${c_0}"; }
 
 OUT="${1:-/root/3xui-backup-$(date +%F-%H%M).tar.gz}"
 TMP=$(mktemp -d)
-trap 'rm -rf "$TMP"' EXIT
+# ${TMP:-}: при set -u не падать, если trap сработает после unset
+trap 'rm -rf "${TMP:-}"' EXIT
 mkdir -p "$TMP/meta" "$TMP/db" "$TMP/etc/x-ui"
 
 XUI_DB_TYPE=sqlite

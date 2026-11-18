@@ -260,10 +260,13 @@ class SqliteStore(Store):
         ).fetchall()
         return [dict(r) for r in rows]
 
-    def list_inbounds(self) -> list[dict]:
-        # stream_settings vs streamSettings — пробуем оба
+    def _stream_cols(self) -> list[str]:
         cols = {r[1] for r in self.conn.execute("PRAGMA table_info(inbounds)").fetchall()}
-        ss = "stream_settings" if "stream_settings" in cols else "streamSettings"
+        found = [c for c in ("stream_settings", "streamSettings") if c in cols]
+        return found or ["stream_settings"]
+
+    def list_inbounds(self) -> list[dict]:
+        ss = self._stream_cols()[0]
         rows = self.conn.execute(
             f"SELECT id, remark, tag, {ss} AS stream_settings FROM inbounds"
         ).fetchall()
@@ -282,12 +285,12 @@ class SqliteStore(Store):
             )
 
     def update_inbound_stream(self, inbound_id: int, stream_settings: str) -> None:
-        cols = {r[1] for r in self.conn.execute("PRAGMA table_info(inbounds)").fetchall()}
-        ss = "stream_settings" if "stream_settings" in cols else "streamSettings"
-        self.conn.execute(
-            f"UPDATE inbounds SET {ss}=? WHERE id=?",
-            (stream_settings, inbound_id),
-        )
+        # пишем во все варианты имени колонки, если вдруг оба есть
+        for ss in self._stream_cols():
+            self.conn.execute(
+                f"UPDATE inbounds SET {ss}=? WHERE id=?",
+                (stream_settings, inbound_id),
+            )
 
     def commit(self) -> None:
         self.conn.commit()
@@ -326,14 +329,28 @@ class PostgresStore(Store):
             )
             return [dict(r) for r in cur.fetchall()]
 
-    def list_inbounds(self) -> list[dict]:
-        with self.conn.cursor(cursor_factory=self.extras.RealDictCursor) as cur:
+    def _stream_col_meta(self) -> list[tuple[str, str]]:
+        """[(column_name, udt_name), ...] для stream_settings / streamSettings."""
+        with self.conn.cursor() as cur:
             cur.execute(
-                "SELECT column_name FROM information_schema.columns "
-                "WHERE table_name='inbounds'"
+                "SELECT column_name, udt_name FROM information_schema.columns "
+                "WHERE table_schema='public' AND table_name='inbounds' "
+                "AND column_name IN ('stream_settings','streamSettings')"
             )
-            cols = {r["column_name"] for r in cur.fetchall()}
-            ss = "stream_settings" if "stream_settings" in cols else "streamSettings"
+            rows = [(r[0], r[1]) for r in cur.fetchall()]
+        if not rows:
+            return [("stream_settings", "text")]
+        # предпочитаем stream_settings первым
+        order = {"stream_settings": 0, "streamSettings": 1}
+        rows.sort(key=lambda x: order.get(x[0], 9))
+        return rows
+
+    def _stream_cols(self) -> list[str]:
+        return [c for c, _ in self._stream_col_meta()]
+
+    def list_inbounds(self) -> list[dict]:
+        ss = self._stream_cols()[0]
+        with self.conn.cursor(cursor_factory=self.extras.RealDictCursor) as cur:
             cur.execute(
                 f"SELECT id, remark, tag, {ss} AS stream_settings FROM inbounds"
             )
@@ -353,17 +370,20 @@ class PostgresStore(Store):
                 )
 
     def update_inbound_stream(self, inbound_id: int, stream_settings: str) -> None:
+        obj = json.loads(stream_settings)
         with self.conn.cursor() as cur:
-            cur.execute(
-                "SELECT column_name FROM information_schema.columns "
-                "WHERE table_name='inbounds'"
-            )
-            cols = {r[0] for r in cur.fetchall()}
-            ss = "stream_settings" if "stream_settings" in cols else "streamSettings"
-            cur.execute(
-                f"UPDATE inbounds SET {ss}=%s WHERE id=%s",
-                (stream_settings, inbound_id),
-            )
+            for col, udt in self._stream_col_meta():
+                if udt in ("json", "jsonb"):
+                    # jsonb: пишем объект, не JSON-строку (иначе двойное экранирование)
+                    cur.execute(
+                        f"UPDATE inbounds SET {col}=%s WHERE id=%s",
+                        (self.extras.Json(obj), inbound_id),
+                    )
+                else:
+                    cur.execute(
+                        f"UPDATE inbounds SET {col}=%s WHERE id=%s",
+                        (stream_settings, inbound_id),
+                    )
 
     def commit(self) -> None:
         self.conn.commit()
@@ -408,6 +428,11 @@ def main() -> int:
         help="Не ротировать hosts: только восстановить downloadSettings "
         "(download = номер uplink-хоста + 1)",
     )
+    ap.add_argument(
+        "--show-split",
+        action="store_true",
+        help="Только показать downloadSettings из БД (не из xray config.json)",
+    )
     ap.add_argument("--dry-run", action="store_true", help="Только показать, не писать")
     ap.add_argument(
         "--db",
@@ -433,6 +458,41 @@ def main() -> int:
     try:
         hosts = store.list_hosts()
         inbounds = store.list_inbounds()
+
+        if args.show_split:
+            found = 0
+            for ib in inbounds:
+                raw = ib.get("stream_settings")
+                try:
+                    st = parse_stream(raw)
+                except Exception as e:
+                    print(f"inbound id={ib['id']} tag={ib.get('tag')}: parse error: {e}")
+                    continue
+                ds = dig(st, "xhttpSettings", "downloadSettings")
+                print(f"inbound id={ib['id']} tag={ib.get('tag')} network={st.get('network')}")
+                if isinstance(ds, dict) and ds:
+                    found += 1
+                    print(json.dumps({"downloadSettings": ds}, ensure_ascii=False, indent=2))
+                else:
+                    extra_ds = dig(st, "xhttpSettings", "extra", "downloadSettings")
+                    if isinstance(extra_ds, dict) and extra_ds:
+                        found += 1
+                        print("  (в extra.downloadSettings — лучше перенести через ensure-split)")
+                        print(json.dumps({"downloadSettings": extra_ds}, ensure_ascii=False, indent=2))
+                    else:
+                        print("  downloadSettings: ОТСУТСТВУЕТ")
+            if found == 0:
+                print(
+                    "Нет downloadSettings в БД. "
+                    "Не смотри config.json — там его вырезает x-ui. Запусти: ensure-split",
+                    file=sys.stderr,
+                )
+                return 1
+            print(
+                f"ok: найдено inbound с downloadSettings: {found}. "
+                "В UI/config.json блока не видно — это нормально."
+            )
+            return 0
 
         texts: list[str | None] = []
         for h in hosts:
