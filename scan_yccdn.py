@@ -824,6 +824,10 @@ def _read_http(tls: ssl.SSLSocket) -> tuple[int, dict]:
     return status, payload
 
 
+def _loopback(hostname: str | None) -> bool:
+    return hostname in ("127.0.0.1", "localhost", "::1")
+
+
 def edge_exchange(
     url: str,
     token: str,
@@ -833,8 +837,10 @@ def edge_exchange(
     timeout: float = 20,
 ) -> dict:
     parsed = urllib.parse.urlsplit(url)
-    if parsed.scheme != "https" or not parsed.hostname:
+    if parsed.scheme not in ("https", "http") or not parsed.hostname:
         raise ValueError(url)
+    if parsed.scheme == "http" and not _loopback(parsed.hostname):
+        raise ValueError("http только на localhost")
     path = parsed.path or "/"
     query = parsed.query
     if method == "GET":
@@ -842,20 +848,23 @@ def edge_exchange(
         query = f"{query}&{stamp}" if query else stamp
     if query:
         path = f"{path}?{query}"
-    ip = via or resolve_host(parsed.hostname)
-    raw = socket.create_connection((ip, parsed.port or 443), timeout)
-    tls: ssl.SSLSocket | None = None
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    ip = via or ("127.0.0.1" if _loopback(parsed.hostname) else resolve_host(parsed.hostname))
+    raw = socket.create_connection((ip, port), timeout)
+    sock = raw
     try:
-        tls = ssl.create_default_context().wrap_socket(raw, server_hostname=parsed.hostname)
-        tls.settimeout(timeout)
+        if parsed.scheme == "https":
+            sock = ssl.create_default_context().wrap_socket(raw, server_hostname=parsed.hostname)
+        sock.settimeout(timeout)
         body = b""
         extra = ""
         if payload is not None:
             body = json.dumps(payload).encode()
             extra = f"Content-Type: application/json\r\nContent-Length: {len(body)}\r\n"
+        host_header = parsed.hostname if not parsed.port else f"{parsed.hostname}:{parsed.port}"
         request = (
             f"{method} {path} HTTP/1.1\r\n"
-            f"Host: {parsed.hostname}\r\n"
+            f"Host: {host_header}\r\n"
             f"X-Edge-Token: {token}\r\n"
             f"Authorization: Bearer {token}\r\n"
             f"Accept: application/json\r\n"
@@ -863,11 +872,11 @@ def edge_exchange(
             f"{extra}"
             "Connection: close\r\n\r\n"
         ).encode() + body
-        tls.sendall(request)
-        status, data = _read_http(tls)
+        sock.sendall(request)
+        status, data = _read_http(sock)
     finally:
         try:
-            (tls or raw).close()
+            sock.close()
         except OSError:
             pass
     if status != 200:
@@ -876,7 +885,8 @@ def edge_exchange(
 
 
 def edge_get(url: str, token: str, vias: list[str]) -> tuple[bool, list[str], str | None]:
-    attempts: list[str | None] = [None, *vias[:5]]
+    host = urllib.parse.urlsplit(url).hostname
+    attempts: list[str | None] = [None] if _loopback(host) else [None, *vias[:5]]
     last = "нет маршрута"
     for via in attempts:
         try:
@@ -894,8 +904,10 @@ def edge_get(url: str, token: str, vias: list[str]) -> tuple[bool, list[str], st
 
 def write_target(url: str) -> str:
     parsed = urllib.parse.urlsplit(url.strip())
-    if parsed.scheme != "https" or not parsed.hostname:
-        raise ValueError("CDN_EDGE_WRITE_URL должен быть https://хост")
+    if parsed.scheme not in ("https", "http") or not parsed.hostname:
+        raise ValueError("CDN_EDGE_WRITE_URL должен быть http://127.0.0.1 или https://хост")
+    if parsed.scheme == "http" and not _loopback(parsed.hostname):
+        raise ValueError("http только на localhost")
     path = parsed.path or "/"
     if path == "/":
         path = "/_edge/v1"
