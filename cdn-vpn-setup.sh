@@ -6,6 +6,8 @@
 #         bash cdn-vpn-setup.sh lock        — пустить на 443 только Yandex CDN
 #         bash cdn-vpn-setup.sh unlock      — снять это ограничение
 #         bash cdn-vpn-setup.sh panel-proxy — открыть панель (2053) и подписки (2096) только для внешнего reverse proxy (NPM)
+#         bash cdn-vpn-setup.sh rotate      — авторотация CDN-доменов (hosts + downloadSettings), без ввода
+#         bash cdn-vpn-setup.sh rotate 10   — то же, uplink=cdn10 / download=cdn11
 # Со старого сервера удобнее: bash cdn-vpn-export.sh (рядом в репозитории).
 # Ответы и прогресс сохраняются в /root/.cdn-vpn.env — скрипт можно прервать и запустить снова.
 
@@ -1021,6 +1023,61 @@ panel_tunnel_hint() {
   say "  и, не закрывая его, открой в браузере ${c_b}http://localhost:8443/${path:-<путь_панели>}/${c_0}"
 }
 
+# Вычислить CDN_PREFIX / CDN_ZONE из CDN_DOMAIN (cdn2.iscreation.ru → cdn / iscreation.ru)
+cdn_zone_from_domain() {
+  local d="${1:-}" pref rest
+  CDN_PREFIX=${CDN_PREFIX:-cdn}
+  CDN_ZONE=${CDN_ZONE:-iscreation.ru}
+  [[ -n "$d" ]] || return 0
+  # cdn / cdn12 + .zone
+  if [[ "$d" =~ ^([a-zA-Z]+)[0-9]*\.(.+)$ ]]; then
+    CDN_PREFIX="${BASH_REMATCH[1]}"
+    CDN_ZONE="${BASH_REMATCH[2]}"
+  fi
+}
+
+step_rotate() {
+  local start="${1:-}" rotate_py self_dir args=()
+  self_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+  rotate_py="$self_dir/cdn-vpn-rotate.py"
+  [[ -f "$rotate_py" ]] || { err "Нет $rotate_py рядом со скриптом"; return 1; }
+  command -v python3 >/dev/null || { err "Нужен python3"; return 1; }
+
+  xui_load_env
+  if [[ "$XUI_DB_TYPE" == postgres ]]; then
+    command -v python3 >/dev/null
+    python3 -c 'import psycopg2' 2>/dev/null \
+      || DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3-psycopg2 >/dev/null \
+      || { err "Не установить python3-psycopg2"; return 1; }
+  else
+    [[ -f /etc/x-ui/x-ui.db ]] || { err "Нет /etc/x-ui/x-ui.db"; return 1; }
+  fi
+
+  cdn_zone_from_domain "${CDN_DOMAIN:-}"
+  export CDN_PREFIX CDN_ZONE
+  say "Ротация доменов ${c_b}${CDN_PREFIX}N.${CDN_ZONE}${c_0} (hosts remark/address/sni + downloadSettings)"
+  [[ -n "$start" ]] && [[ "$start" =~ ^[0-9]+$ ]] && [[ "$start" -ge 1 ]] \
+    && args+=(--start "$start") \
+    || { [[ -z "$start" ]] || { err "Номер uplink — целое >= 1, получено: '$start'"; return 1; }; }
+
+  say "Страховочный бэкап перед ротацией..."
+  step_backup >/tmp/cdn-rotate-backup.log 2>&1 \
+    && ok "Бэкап снят (см. /tmp/cdn-rotate-backup.log)" \
+    || warn "Бэкап не удался — продолжаю ротацию (лог /tmp/cdn-rotate-backup.log)"
+
+  python3 "$rotate_py" "${args[@]}" || return 1
+
+  systemctl restart x-ui 2>/dev/null || true
+  sleep 2
+  systemctl is-active --quiet x-ui && ok "x-ui перезапущен" || warn "x-ui не активен — journalctl -u x-ui -n 30"
+
+  say "\nДальше вручную в Yandex Cloud / DNS:"
+  say "  • выпусти/привяжи сертификат и CDN-ресурс на новый uplink/download;"
+  say "  • CNAME ${c_b}${CDN_PREFIX}N.${CDN_ZONE}${c_0} → технический домен CDN;"
+  say "  • клиенты подтянут новые домены после обновления подписки."
+  say "Повтор: ${c_b}bash $0 rotate${c_0}   или   ${c_b}bash $0 rotate 10${c_0}"
+}
+
 step_finish() {
   say "${c_g}Готово.${c_0}\n"
   todo "Подключи телефон: Happ / v2RayTun / v2rayNG / v2rayN (последней версии) → импорт ссылки из панели."
@@ -1048,6 +1105,12 @@ command -v dig >/dev/null || { apt-get update -qq && apt-get install -y -qq dnsu
 if [[ "${1:-}" == backup ]]; then
   hdr B "Бэкап 3x-ui (Postgres + SQLite + sub-theme)"
   step_backup
+  exit
+fi
+
+if [[ "${1:-}" == rotate ]]; then
+  hdr R "Ротация CDN-доменов (авто)"
+  step_rotate "${2:-}"
   exit
 fi
 

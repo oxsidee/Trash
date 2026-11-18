@@ -1,0 +1,511 @@
+#!/usr/bin/env python3
+"""Ротация CDN-доменов для 3x-ui (hosts + downloadSettings).
+
+Читает/пишет SQLite или Postgres. Вызов:
+  CDN_ZONE=iscreation.ru CDN_PREFIX=cdn \\
+    python3 cdn-vpn-rotate.py [--start N] [--dry-run] [--db sqlite|/path|postgres]
+
+Без --start: MAX из текущих доменов → uplink=cdn{MAX+1}, download=cdn{MAX+2}.
+cdn.iscreation.ru без номера считается как 1.
+С --start 10: uplink=cdn10, download=cdn11.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sqlite3
+import sys
+from copy import deepcopy
+from typing import Any
+from urllib.parse import unquote, urlparse
+
+
+def env_zone() -> tuple[str, str]:
+    prefix = os.environ.get("CDN_PREFIX", "cdn").strip() or "cdn"
+    zone = os.environ.get("CDN_ZONE", "iscreation.ru").strip() or "iscreation.ru"
+    return prefix, zone
+
+
+def domain_re(prefix: str, zone: str) -> re.Pattern[str]:
+    # cdn.iscreation.ru → 1; cdn12.iscreation.ru → 12
+    z = re.escape(zone)
+    p = re.escape(prefix)
+    return re.compile(rf"(?i)\b{p}(\d*)\.{z}\b")
+
+
+def parse_num(text: str | None, prefix: str, zone: str) -> int | None:
+    if not text:
+        return None
+    m = domain_re(prefix, zone).search(str(text))
+    if not m:
+        return None
+    digits = m.group(1)
+    return int(digits) if digits else 1
+
+
+def make_domain(n: int, prefix: str, zone: str) -> str:
+    return f"{prefix}{n}.{zone}"
+
+
+def collect_max(texts: list[str | None], prefix: str, zone: str) -> int:
+    nums = [parse_num(t, prefix, zone) for t in texts]
+    found = [n for n in nums if n is not None]
+    return max(found) if found else 1
+
+
+def dig(obj: Any, *path: str) -> Any:
+    cur = obj
+    for p in path:
+        if not isinstance(cur, dict) or p not in cur:
+            return None
+        cur = cur[p]
+    return cur
+
+
+def ensure_dict(parent: dict, key: str) -> dict:
+    v = parent.get(key)
+    if not isinstance(v, dict):
+        v = {}
+        parent[key] = v
+    return v
+
+
+def find_download_settings(stream: dict) -> tuple[dict, dict]:
+    """Вернуть (container, downloadSettings) — создать при отсутствии.
+
+    Ищем в xhttpSettings.downloadSettings и xhttpSettings.extra.downloadSettings.
+    Предпочтение — где уже есть; иначе создаём в xhttpSettings.downloadSettings.
+    """
+    xhttp = ensure_dict(stream, "xhttpSettings")
+    extra = xhttp.get("extra") if isinstance(xhttp.get("extra"), dict) else None
+
+    if isinstance(xhttp.get("downloadSettings"), dict):
+        return xhttp, xhttp["downloadSettings"]
+    if extra is not None and isinstance(extra.get("downloadSettings"), dict):
+        return extra, extra["downloadSettings"]
+    # создать
+    ds: dict = {}
+    xhttp["downloadSettings"] = ds
+    return xhttp, ds
+
+
+def extract_download_domains(stream_raw: str | None, prefix: str, zone: str) -> list[str]:
+    out: list[str] = []
+    if not stream_raw:
+        return out
+    try:
+        stream = json.loads(stream_raw)
+    except Exception:
+        return out
+    if not isinstance(stream, dict):
+        return out
+    xhttp = stream.get("xhttpSettings") if isinstance(stream.get("xhttpSettings"), dict) else {}
+    candidates = []
+    for container in (xhttp, xhttp.get("extra") if isinstance(xhttp.get("extra"), dict) else {}):
+        if not isinstance(container, dict):
+            continue
+        ds = container.get("downloadSettings")
+        if not isinstance(ds, dict):
+            continue
+        candidates.extend(
+            [
+                ds.get("address"),
+                dig(ds, "tlsSettings", "serverName"),
+                dig(ds, "xhttpSettings", "host"),
+            ]
+        )
+    return [str(c) for c in candidates if c]
+
+
+def patch_download_settings(
+    stream_raw: str,
+    download_domain: str,
+    *,
+    path_fallback: str = "/",
+) -> str:
+    try:
+        stream = json.loads(stream_raw) if stream_raw else {}
+    except Exception as e:
+        raise SystemExit(f"Не разобрать stream_settings JSON: {e}") from e
+    if not isinstance(stream, dict):
+        stream = {}
+
+    # path из основного inbound
+    xhttp = ensure_dict(stream, "xhttpSettings")
+    path = xhttp.get("path") or path_fallback
+    mode = xhttp.get("mode") or "packet-up"
+
+    _container, ds = find_download_settings(stream)
+
+    # сохранить/заполнить обязательные поля
+    ds["address"] = download_domain
+    ds["port"] = int(ds["port"]) if isinstance(ds.get("port"), (int, float, str)) and str(ds.get("port")).isdigit() else 443
+    ds["network"] = ds.get("network") or "xhttp"
+    ds["security"] = ds.get("security") or "tls"
+
+    tls = ensure_dict(ds, "tlsSettings")
+    tls["serverName"] = download_domain
+    if not tls.get("fingerprint"):
+        tls["fingerprint"] = "chrome"
+    if not tls.get("alpn"):
+        tls["alpn"] = ["h2", "http/1.1"]
+
+    dx = ensure_dict(ds, "xhttpSettings")
+    dx["host"] = download_domain
+    if not dx.get("path"):
+        dx["path"] = path
+    if not dx.get("mode"):
+        dx["mode"] = mode
+    # xPaddingBytes часто лежит в extra
+    extra = ensure_dict(dx, "extra") if "extra" in dx or "xPaddingBytes" not in dx else dx
+    if isinstance(dx.get("extra"), dict):
+        extra = dx["extra"]
+        if "xPaddingBytes" not in extra:
+            extra["xPaddingBytes"] = "100-1000"
+    elif "xPaddingBytes" not in dx:
+        dx.setdefault("extra", {})
+        if isinstance(dx["extra"], dict) and "xPaddingBytes" not in dx["extra"]:
+            dx["extra"]["xPaddingBytes"] = "100-1000"
+
+    return json.dumps(stream, ensure_ascii=False, separators=(",", ":"))
+
+
+# --- DB backends ---
+
+def parse_pg_dsn(dsn: str) -> dict:
+    u = urlparse(dsn)
+    if u.scheme not in ("postgres", "postgresql"):
+        raise SystemExit(f"Не Postgres DSN: {dsn}")
+    return {
+        "user": unquote(u.username or ""),
+        "password": unquote(u.password or ""),
+        "host": u.hostname or "127.0.0.1",
+        "port": u.port or 5432,
+        "dbname": (u.path or "/xui").lstrip("/") or "xui",
+    }
+
+
+class Store:
+    def list_hosts(self) -> list[dict]:
+        raise NotImplementedError
+
+    def list_inbounds(self) -> list[dict]:
+        raise NotImplementedError
+
+    def update_host(self, host_id: int, remark: str, address: str, sni: str | None) -> None:
+        raise NotImplementedError
+
+    def update_inbound_stream(self, inbound_id: int, stream_settings: str) -> None:
+        raise NotImplementedError
+
+    def close(self) -> None:
+        pass
+
+
+class SqliteStore(Store):
+    def __init__(self, path: str):
+        if not os.path.isfile(path):
+            raise SystemExit(f"Нет SQLite БД: {path}")
+        self.conn = sqlite3.connect(path)
+        self.conn.row_factory = sqlite3.Row
+
+    def list_hosts(self) -> list[dict]:
+        cur = self.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='hosts'"
+        )
+        if not cur.fetchone():
+            return []
+        rows = self.conn.execute(
+            "SELECT id, inbound_id, remark, address, sni, override_sni_from_address, "
+            "is_disabled, host_header FROM hosts"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def list_inbounds(self) -> list[dict]:
+        # stream_settings vs streamSettings — пробуем оба
+        cols = {r[1] for r in self.conn.execute("PRAGMA table_info(inbounds)").fetchall()}
+        ss = "stream_settings" if "stream_settings" in cols else "streamSettings"
+        rows = self.conn.execute(
+            f"SELECT id, remark, tag, {ss} AS stream_settings FROM inbounds"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def update_host(self, host_id: int, remark: str, address: str, sni: str | None) -> None:
+        if sni is None:
+            self.conn.execute(
+                "UPDATE hosts SET remark=?, address=? WHERE id=?",
+                (remark, address, host_id),
+            )
+        else:
+            self.conn.execute(
+                "UPDATE hosts SET remark=?, address=?, sni=? WHERE id=?",
+                (remark, address, sni, host_id),
+            )
+
+    def update_inbound_stream(self, inbound_id: int, stream_settings: str) -> None:
+        cols = {r[1] for r in self.conn.execute("PRAGMA table_info(inbounds)").fetchall()}
+        ss = "stream_settings" if "stream_settings" in cols else "streamSettings"
+        self.conn.execute(
+            f"UPDATE inbounds SET {ss}=? WHERE id=?",
+            (stream_settings, inbound_id),
+        )
+
+    def commit(self) -> None:
+        self.conn.commit()
+
+    def close(self) -> None:
+        self.conn.close()
+
+
+class PostgresStore(Store):
+    def __init__(self, dsn: str):
+        try:
+            import psycopg2
+            import psycopg2.extras
+        except ImportError:
+            # fallback: use subprocess psql — but prefer psycopg2
+            raise SystemExit(
+                "Нужен python3-psycopg2 (apt install python3-psycopg2) для Postgres"
+            ) from None
+        self.psycopg2 = psycopg2
+        self.extras = psycopg2.extras
+        kw = parse_pg_dsn(dsn)
+        self.conn = psycopg2.connect(**kw)
+        self.conn.autocommit = False
+
+    def list_hosts(self) -> list[dict]:
+        with self.conn.cursor(cursor_factory=self.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT EXISTS (SELECT 1 FROM information_schema.tables "
+                "WHERE table_name='hosts')"
+            )
+            if not cur.fetchone()["exists"]:
+                return []
+            cur.execute(
+                "SELECT id, inbound_id, remark, address, sni, override_sni_from_address, "
+                "is_disabled, host_header FROM hosts"
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+    def list_inbounds(self) -> list[dict]:
+        with self.conn.cursor(cursor_factory=self.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name='inbounds'"
+            )
+            cols = {r["column_name"] for r in cur.fetchall()}
+            ss = "stream_settings" if "stream_settings" in cols else "streamSettings"
+            cur.execute(
+                f"SELECT id, remark, tag, {ss} AS stream_settings FROM inbounds"
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+    def update_host(self, host_id: int, remark: str, address: str, sni: str | None) -> None:
+        with self.conn.cursor() as cur:
+            if sni is None:
+                cur.execute(
+                    "UPDATE hosts SET remark=%s, address=%s WHERE id=%s",
+                    (remark, address, host_id),
+                )
+            else:
+                cur.execute(
+                    "UPDATE hosts SET remark=%s, address=%s, sni=%s WHERE id=%s",
+                    (remark, address, sni, host_id),
+                )
+
+    def update_inbound_stream(self, inbound_id: int, stream_settings: str) -> None:
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name='inbounds'"
+            )
+            cols = {r[0] for r in cur.fetchall()}
+            ss = "stream_settings" if "stream_settings" in cols else "streamSettings"
+            cur.execute(
+                f"UPDATE inbounds SET {ss}=%s WHERE id=%s",
+                (stream_settings, inbound_id),
+            )
+
+    def commit(self) -> None:
+        self.conn.commit()
+
+    def close(self) -> None:
+        self.conn.close()
+
+
+def open_store(args: argparse.Namespace) -> Store:
+    db = args.db
+    if db == "auto":
+        env_path = "/etc/default/x-ui"
+        db_type = "sqlite"
+        dsn = ""
+        if os.path.isfile(env_path):
+            for line in open(env_path, encoding="utf-8", errors="ignore"):
+                line = line.strip()
+                if line.startswith("XUI_DB_TYPE="):
+                    db_type = line.split("=", 1)[1].strip().strip("'\"")
+                elif line.startswith("XUI_DB_DSN="):
+                    dsn = line.split("=", 1)[1].strip().strip("'\"")
+        if db_type.lower() in ("postgres", "postgresql", "pg") and dsn:
+            return PostgresStore(dsn)
+        return SqliteStore("/etc/x-ui/x-ui.db")
+    if db.startswith("postgres"):
+        return PostgresStore(db if "://" in db else os.environ.get("XUI_DB_DSN", ""))
+    return SqliteStore(db)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Ротация CDN-доменов 3x-ui")
+    ap.add_argument(
+        "--start",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Номер uplink вручную (cdnN / cdnN+1). Без флага — MAX+1 / MAX+2",
+    )
+    ap.add_argument("--dry-run", action="store_true", help="Только показать, не писать")
+    ap.add_argument(
+        "--db",
+        default="auto",
+        help="auto | путь к sqlite | postgres DSN",
+    )
+    ap.add_argument(
+        "--inbound-id",
+        type=int,
+        default=None,
+        help="Ограничить одним inbound id (по умолчанию — все xhttp)",
+    )
+    ap.add_argument(
+        "--host-id",
+        type=int,
+        default=None,
+        help="Ограничить одним host id (по умолчанию — все подходящие)",
+    )
+    args = ap.parse_args()
+    prefix, zone = env_zone()
+
+    store = open_store(args)
+    try:
+        hosts = store.list_hosts()
+        inbounds = store.list_inbounds()
+
+        texts: list[str | None] = []
+        for h in hosts:
+            texts.extend([h.get("remark"), h.get("address"), h.get("sni"), h.get("host_header")])
+        for ib in inbounds:
+            texts.append(ib.get("remark"))
+            texts.append(ib.get("tag"))
+            texts.extend(extract_download_domains(ib.get("stream_settings"), prefix, zone))
+            # также адресные поля из stream (host/sni uplink-стороны)
+            try:
+                st = json.loads(ib.get("stream_settings") or "{}")
+                if isinstance(st, dict):
+                    texts.append(dig(st, "tlsSettings", "serverName"))
+                    texts.append(dig(st, "xhttpSettings", "host"))
+            except Exception:
+                pass
+
+        cur_max = collect_max(texts, prefix, zone)
+        if args.start is not None:
+            if args.start < 1:
+                raise SystemExit("--start должен быть >= 1")
+            up_n = args.start
+        else:
+            up_n = cur_max + 1
+        down_n = up_n + 1
+        uplink = make_domain(up_n, prefix, zone)
+        download = make_domain(down_n, prefix, zone)
+
+        print(f"zone={prefix}.*.{zone}")
+        print(f"current_max={cur_max}")
+        print(f"uplink={uplink}")
+        print(f"download={download}")
+
+        # hosts
+        host_updates = []
+        for h in hosts:
+            if args.host_id is not None and int(h["id"]) != args.host_id:
+                continue
+            if h.get("is_disabled"):
+                continue
+            # трогаем хосты, у которых address/remark/sni похожи на наши cdn*, либо все если один
+            related = any(
+                parse_num(h.get(k), prefix, zone) is not None
+                for k in ("address", "remark", "sni", "host_header")
+            )
+            if not related and len(hosts) > 1:
+                continue
+            override = bool(h.get("override_sni_from_address"))
+            new_sni = None if override else uplink
+            host_updates.append((h, new_sni))
+
+        if not host_updates and hosts:
+            # fallback: первый не disabled
+            for h in hosts:
+                if not h.get("is_disabled"):
+                    override = bool(h.get("override_sni_from_address"))
+                    host_updates.append((h, None if override else uplink))
+                    break
+
+        for h, new_sni in host_updates:
+            print(
+                f"host id={h['id']}: remark/address "
+                f"{h.get('remark')!r}/{h.get('address')!r} → {uplink}"
+                + (f", sni → {new_sni}" if new_sni else " (sni from address)")
+            )
+            if not args.dry_run:
+                store.update_host(int(h["id"]), uplink, uplink, new_sni)
+
+        # inbounds stream_settings
+        ib_updates = 0
+        for ib in inbounds:
+            if args.inbound_id is not None and int(ib["id"]) != args.inbound_id:
+                continue
+            raw = ib.get("stream_settings") or ""
+            try:
+                st = json.loads(raw) if raw else {}
+            except Exception:
+                continue
+            if not isinstance(st, dict):
+                continue
+            if st.get("network") != "xhttp" and "xhttpSettings" not in st:
+                # всё равно обновим, если уже есть downloadSettings
+                has_ds = False
+                xh = st.get("xhttpSettings") if isinstance(st.get("xhttpSettings"), dict) else {}
+                if isinstance(xh.get("downloadSettings"), dict):
+                    has_ds = True
+                extra = xh.get("extra") if isinstance(xh.get("extra"), dict) else {}
+                if isinstance(extra.get("downloadSettings"), dict):
+                    has_ds = True
+                if not has_ds:
+                    continue
+
+            before = deepcopy(st)
+            new_raw = patch_download_settings(raw, download)
+            after = json.loads(new_raw)
+            if before == after and not extract_download_domains(raw, prefix, zone):
+                # всё равно пишем, если ds не было — patch создаёт
+                pass
+            print(f"inbound id={ib['id']} tag={ib.get('tag')}: downloadSettings → {download}")
+            if not args.dry_run:
+                store.update_inbound_stream(int(ib["id"]), new_raw)
+            ib_updates += 1
+
+        if not host_updates and ib_updates == 0:
+            print("Нечего обновлять: нет hosts/inbounds", file=sys.stderr)
+            return 1
+
+        if args.dry_run:
+            print("dry-run: изменений не записано")
+        else:
+            store.commit()
+            print("ok: записано в БД")
+        return 0
+    finally:
+        store.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
