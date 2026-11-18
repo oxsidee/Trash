@@ -612,17 +612,19 @@ def scan(nets: list[ipaddress.IPv4Network], total: int) -> int:
                 if hit is not None:
                     ip, ms = hit
                     found += 1
-                    line = f"{ip} {ms}ms"
-                    print(line, flush=True)
-                    out.write(line + "\n")
+                    _show_hit(ip, ms)
+                    out.write(f"{ip} {ms}ms\n")
                     out.flush()
                     os.fsync(out.fileno())
+                    _progress(checked, total, found, started, stay=True)
                 step = checked // PROGRESS_EVERY
                 if step > mark:
                     mark = step
-                    _progress(checked, total, found, started)
+                    _progress(checked, total, found, started, stay=False)
+                elif checked % 500 == 0:
+                    _progress(checked, total, found, started, stay=True)
         if checked % PROGRESS_EVERY:
-            _progress(checked, total, found, started)
+            _progress(checked, total, found, started, stay=False)
         return found
     except KeyboardInterrupt:
         interrupted = True
@@ -640,13 +642,22 @@ def scan(nets: list[ipaddress.IPv4Network], total: int) -> int:
             os._exit(130)
 
 
-def _progress(checked: int, total: int, found: int, started: float) -> None:
+def _show_hit(ip: str, ms: int) -> None:
+    line = f"{ip} {ms}ms"
+    if os.isatty(1):
+        print(f"\r\033[K\033[1;32m{line}\033[0m", flush=True)
+    else:
+        print(f"\r\033[K{line}", flush=True)
+
+
+def _progress(checked: int, total: int, found: int, started: float, *, stay: bool) -> None:
     elapsed = max(time.monotonic() - started, 0.001)
-    pct = (100.0 * checked / total) if total else 0.0
-    print(
-        f"{checked}/{total} {pct:.1f}% {checked / elapsed:.0f} ip/s найдено {found}",
-        flush=True,
-    )
+    pct = (100.0 * checked / total) if total else 100.0
+    text = f"{pct:5.1f}%  {checked}/{total}  {checked / elapsed:.0f} ip/s  найдено {found}"
+    if stay:
+        print(f"\r{text}", end="", flush=True)
+    else:
+        print(f"\r\033[K{text}", flush=True)
 
 
 def main() -> None:
