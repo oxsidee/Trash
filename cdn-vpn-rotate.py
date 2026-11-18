@@ -72,34 +72,48 @@ def ensure_dict(parent: dict, key: str) -> dict:
     return v
 
 
-def find_download_settings(stream: dict) -> tuple[dict, dict]:
-    """Вернуть (container, downloadSettings) — создать при отсутствии.
+def parse_stream(raw: Any) -> dict:
+    """stream_settings из SQLite — строка; из Postgres jsonb — уже dict."""
+    if raw is None or raw == "":
+        return {}
+    if isinstance(raw, dict):
+        return deepcopy(raw)
+    if isinstance(raw, (bytes, bytearray)):
+        raw = raw.decode("utf-8", errors="replace")
+    if isinstance(raw, str):
+        try:
+            obj = json.loads(raw)
+        except Exception as e:
+            raise ValueError(f"Не разобрать stream_settings JSON: {e}") from e
+        return obj if isinstance(obj, dict) else {}
+    raise ValueError(f"Неожиданный тип stream_settings: {type(raw)}")
 
-    Ищем в xhttpSettings.downloadSettings и xhttpSettings.extra.downloadSettings.
-    Предпочтение — где уже есть; иначе создаём в xhttpSettings.downloadSettings.
+
+def find_download_settings(stream: dict) -> dict:
+    """Вернуть downloadSettings внутри xhttpSettings (каноничное место для 3x-ui).
+
+    Если блок был в xhttpSettings.extra.downloadSettings — переносим наверх.
     """
     xhttp = ensure_dict(stream, "xhttpSettings")
-    extra = xhttp.get("extra") if isinstance(xhttp.get("extra"), dict) else None
-
     if isinstance(xhttp.get("downloadSettings"), dict):
-        return xhttp, xhttp["downloadSettings"]
+        return xhttp["downloadSettings"]
+
+    extra = xhttp.get("extra") if isinstance(xhttp.get("extra"), dict) else None
     if extra is not None and isinstance(extra.get("downloadSettings"), dict):
-        return extra, extra["downloadSettings"]
-    # создать
+        ds = extra.pop("downloadSettings")
+        xhttp["downloadSettings"] = ds
+        return ds
+
     ds: dict = {}
     xhttp["downloadSettings"] = ds
-    return xhttp, ds
+    return ds
 
 
-def extract_download_domains(stream_raw: str | None, prefix: str, zone: str) -> list[str]:
+def extract_download_domains(stream_raw: Any, prefix: str, zone: str) -> list[str]:
     out: list[str] = []
-    if not stream_raw:
-        return out
     try:
-        stream = json.loads(stream_raw)
+        stream = parse_stream(stream_raw)
     except Exception:
-        return out
-    if not isinstance(stream, dict):
         return out
     xhttp = stream.get("xhttpSettings") if isinstance(stream.get("xhttpSettings"), dict) else {}
     candidates = []
@@ -120,57 +134,80 @@ def extract_download_domains(stream_raw: str | None, prefix: str, zone: str) -> 
 
 
 def patch_download_settings(
-    stream_raw: str,
+    stream_raw: Any,
     download_domain: str,
     *,
     path_fallback: str = "/",
 ) -> str:
-    try:
-        stream = json.loads(stream_raw) if stream_raw else {}
-    except Exception as e:
-        raise SystemExit(f"Не разобрать stream_settings JSON: {e}") from e
-    if not isinstance(stream, dict):
-        stream = {}
+    """Гарантирует разделение uplink/download в точности как в рабочей схеме:
 
-    # path из основного inbound
+    xhttpSettings.downloadSettings = {
+      address, port, network, security,
+      tlsSettings: {serverName, fingerprint, alpn},
+      xhttpSettings: {host, path, mode, xPaddingBytes}
+    }
+    """
+    stream = parse_stream(stream_raw)
+
     xhttp = ensure_dict(stream, "xhttpSettings")
     path = xhttp.get("path") or path_fallback
     mode = xhttp.get("mode") or "packet-up"
 
-    _container, ds = find_download_settings(stream)
+    ds = find_download_settings(stream)
 
-    # сохранить/заполнить обязательные поля
+    # точная структура разделения потоков
     ds["address"] = download_domain
-    ds["port"] = int(ds["port"]) if isinstance(ds.get("port"), (int, float, str)) and str(ds.get("port")).isdigit() else 443
-    ds["network"] = ds.get("network") or "xhttp"
-    ds["security"] = ds.get("security") or "tls"
+    try:
+        port = int(ds.get("port", 443))
+    except (TypeError, ValueError):
+        port = 443
+    ds["port"] = port if port > 0 else 443
+    ds["network"] = "xhttp"
+    ds["security"] = "tls"
 
     tls = ensure_dict(ds, "tlsSettings")
     tls["serverName"] = download_domain
-    if not tls.get("fingerprint"):
-        tls["fingerprint"] = "chrome"
-    if not tls.get("alpn"):
+    tls["fingerprint"] = tls.get("fingerprint") or "chrome"
+    if not isinstance(tls.get("alpn"), list) or not tls.get("alpn"):
         tls["alpn"] = ["h2", "http/1.1"]
 
     dx = ensure_dict(ds, "xhttpSettings")
     dx["host"] = download_domain
-    if not dx.get("path"):
-        dx["path"] = path
-    if not dx.get("mode"):
-        dx["mode"] = mode
-    # xPaddingBytes часто лежит в extra
-    extra = ensure_dict(dx, "extra") if "extra" in dx or "xPaddingBytes" not in dx else dx
-    if isinstance(dx.get("extra"), dict):
-        extra = dx["extra"]
-        if "xPaddingBytes" not in extra:
-            extra["xPaddingBytes"] = "100-1000"
-    elif "xPaddingBytes" not in dx:
-        dx.setdefault("extra", {})
-        if isinstance(dx["extra"], dict) and "xPaddingBytes" not in dx["extra"]:
-            dx["extra"]["xPaddingBytes"] = "100-1000"
+    dx["path"] = dx.get("path") or path
+    dx["mode"] = dx.get("mode") or mode
+    # как у рабочей схемы — на верхнем уровне download.xhttpSettings, не в extra
+    if not dx.get("xPaddingBytes"):
+        if isinstance(dx.get("extra"), dict) and dx["extra"].get("xPaddingBytes"):
+            dx["xPaddingBytes"] = dx["extra"].pop("xPaddingBytes")
+        else:
+            dx["xPaddingBytes"] = "100-1000"
+    # убрать пустой extra
+    if isinstance(dx.get("extra"), dict) and not dx["extra"]:
+        dx.pop("extra", None)
+
+    # каноничное место — только xhttpSettings.downloadSettings
+    xhttp["downloadSettings"] = ds
+    if isinstance(xhttp.get("extra"), dict):
+        xhttp["extra"].pop("downloadSettings", None)
+        if not xhttp["extra"]:
+            xhttp.pop("extra", None)
 
     return json.dumps(stream, ensure_ascii=False, separators=(",", ":"))
 
+
+def download_settings_ok(stream_raw: Any, expect_domain: str) -> bool:
+    try:
+        st = parse_stream(stream_raw)
+    except Exception:
+        return False
+    ds = dig(st, "xhttpSettings", "downloadSettings")
+    if not isinstance(ds, dict):
+        return False
+    return (
+        ds.get("address") == expect_domain
+        and dig(ds, "tlsSettings", "serverName") == expect_domain
+        and dig(ds, "xhttpSettings", "host") == expect_domain
+    )
 
 # --- DB backends ---
 
@@ -365,6 +402,12 @@ def main() -> int:
         metavar="N",
         help="Номер uplink вручную (cdnN / cdnN+1). Без флага — MAX+1 / MAX+2",
     )
+    ap.add_argument(
+        "--ensure-split",
+        action="store_true",
+        help="Не ротировать hosts: только восстановить downloadSettings "
+        "(download = номер uplink-хоста + 1)",
+    )
     ap.add_argument("--dry-run", action="store_true", help="Только показать, не писать")
     ap.add_argument(
         "--db",
@@ -398,97 +441,115 @@ def main() -> int:
             texts.append(ib.get("remark"))
             texts.append(ib.get("tag"))
             texts.extend(extract_download_domains(ib.get("stream_settings"), prefix, zone))
-            # также адресные поля из stream (host/sni uplink-стороны)
             try:
-                st = json.loads(ib.get("stream_settings") or "{}")
-                if isinstance(st, dict):
-                    texts.append(dig(st, "tlsSettings", "serverName"))
-                    texts.append(dig(st, "xhttpSettings", "host"))
+                st = parse_stream(ib.get("stream_settings"))
+                texts.append(dig(st, "tlsSettings", "serverName"))
+                texts.append(dig(st, "xhttpSettings", "host"))
             except Exception:
                 pass
 
         cur_max = collect_max(texts, prefix, zone)
-        if args.start is not None:
-            if args.start < 1:
-                raise SystemExit("--start должен быть >= 1")
-            up_n = args.start
-        else:
-            up_n = cur_max + 1
-        down_n = up_n + 1
-        uplink = make_domain(up_n, prefix, zone)
-        download = make_domain(down_n, prefix, zone)
 
-        print(f"zone={prefix}.*.{zone}")
-        print(f"current_max={cur_max}")
-        print(f"uplink={uplink}")
-        print(f"download={download}")
-
-        # hosts
-        host_updates = []
-        for h in hosts:
-            if args.host_id is not None and int(h["id"]) != args.host_id:
-                continue
-            if h.get("is_disabled"):
-                continue
-            # трогаем хосты, у которых address/remark/sni похожи на наши cdn*, либо все если один
-            related = any(
-                parse_num(h.get(k), prefix, zone) is not None
-                for k in ("address", "remark", "sni", "host_header")
-            )
-            if not related and len(hosts) > 1:
-                continue
-            override = bool(h.get("override_sni_from_address"))
-            new_sni = None if override else uplink
-            host_updates.append((h, new_sni))
-
-        if not host_updates and hosts:
-            # fallback: первый не disabled
+        if args.ensure_split:
+            # uplink = текущий адрес хоста (не бампим); download = uplink+1
+            host_nums = []
             for h in hosts:
-                if not h.get("is_disabled"):
-                    override = bool(h.get("override_sni_from_address"))
-                    host_updates.append((h, None if override else uplink))
-                    break
+                if h.get("is_disabled"):
+                    continue
+                for k in ("address", "remark", "sni"):
+                    n = parse_num(h.get(k), prefix, zone)
+                    if n is not None:
+                        host_nums.append(n)
+            up_n = max(host_nums) if host_nums else cur_max
+            if args.start is not None:
+                if args.start < 1:
+                    raise SystemExit("--start должен быть >= 1")
+                up_n = args.start
+            downlink_n = up_n + 1
+            uplink = make_domain(up_n, prefix, zone)
+            download = make_domain(downlink_n, prefix, zone)
+            print(f"mode=ensure-split")
+            print(f"zone={prefix}.*.{zone}")
+            print(f"uplink(keep)={uplink}")
+            print(f"download={download}")
+            host_updates = []
+        else:
+            if args.start is not None:
+                if args.start < 1:
+                    raise SystemExit("--start должен быть >= 1")
+                up_n = args.start
+            else:
+                up_n = cur_max + 1
+            downlink_n = up_n + 1
+            uplink = make_domain(up_n, prefix, zone)
+            download = make_domain(downlink_n, prefix, zone)
 
-        for h, new_sni in host_updates:
-            print(
-                f"host id={h['id']}: remark/address "
-                f"{h.get('remark')!r}/{h.get('address')!r} → {uplink}"
-                + (f", sni → {new_sni}" if new_sni else " (sni from address)")
-            )
-            if not args.dry_run:
-                store.update_host(int(h["id"]), uplink, uplink, new_sni)
+            print(f"zone={prefix}.*.{zone}")
+            print(f"current_max={cur_max}")
+            print(f"uplink={uplink}")
+            print(f"download={download}")
 
-        # inbounds stream_settings
+            host_updates = []
+            for h in hosts:
+                if args.host_id is not None and int(h["id"]) != args.host_id:
+                    continue
+                if h.get("is_disabled"):
+                    continue
+                related = any(
+                    parse_num(h.get(k), prefix, zone) is not None
+                    for k in ("address", "remark", "sni", "host_header")
+                )
+                if not related and len(hosts) > 1:
+                    continue
+                override = bool(h.get("override_sni_from_address"))
+                new_sni = None if override else uplink
+                host_updates.append((h, new_sni))
+
+            if not host_updates and hosts:
+                for h in hosts:
+                    if not h.get("is_disabled"):
+                        override = bool(h.get("override_sni_from_address"))
+                        host_updates.append((h, None if override else uplink))
+                        break
+
+            for h, new_sni in host_updates:
+                print(
+                    f"host id={h['id']}: remark/address "
+                    f"{h.get('remark')!r}/{h.get('address')!r} → {uplink}"
+                    + (f", sni → {new_sni}" if new_sni else " (sni from address)")
+                )
+                if not args.dry_run:
+                    store.update_host(int(h["id"]), uplink, uplink, new_sni)
+
+        # inbounds: всегда гарантируем downloadSettings (разделение потоков)
         ib_updates = 0
         for ib in inbounds:
             if args.inbound_id is not None and int(ib["id"]) != args.inbound_id:
                 continue
-            raw = ib.get("stream_settings") or ""
+            raw = ib.get("stream_settings")
             try:
-                st = json.loads(raw) if raw else {}
-            except Exception:
-                continue
-            if not isinstance(st, dict):
+                st = parse_stream(raw)
+            except Exception as e:
+                print(f"inbound id={ib['id']}: skip ({e})", file=sys.stderr)
                 continue
             if st.get("network") != "xhttp" and "xhttpSettings" not in st:
-                # всё равно обновим, если уже есть downloadSettings
-                has_ds = False
-                xh = st.get("xhttpSettings") if isinstance(st.get("xhttpSettings"), dict) else {}
-                if isinstance(xh.get("downloadSettings"), dict):
-                    has_ds = True
-                extra = xh.get("extra") if isinstance(xh.get("extra"), dict) else {}
-                if isinstance(extra.get("downloadSettings"), dict):
-                    has_ds = True
+                has_ds = bool(dig(st, "xhttpSettings", "downloadSettings")) or bool(
+                    dig(st, "xhttpSettings", "extra", "downloadSettings")
+                )
                 if not has_ds:
                     continue
 
-            before = deepcopy(st)
             new_raw = patch_download_settings(raw, download)
-            after = json.loads(new_raw)
-            if before == after and not extract_download_domains(raw, prefix, zone):
-                # всё равно пишем, если ds не было — patch создаёт
-                pass
             print(f"inbound id={ib['id']} tag={ib.get('tag')}: downloadSettings → {download}")
+            # показать ключевые поля
+            after = json.loads(new_raw)
+            ds = dig(after, "xhttpSettings", "downloadSettings") or {}
+            print(
+                f"  address={ds.get('address')}  "
+                f"serverName={dig(ds, 'tlsSettings', 'serverName')}  "
+                f"host={dig(ds, 'xhttpSettings', 'host')}  "
+                f"path={dig(ds, 'xhttpSettings', 'path')}"
+            )
             if not args.dry_run:
                 store.update_inbound_stream(int(ib["id"]), new_raw)
             ib_updates += 1
@@ -501,7 +562,37 @@ def main() -> int:
             print("dry-run: изменений не записано")
         else:
             store.commit()
-            print("ok: записано в БД")
+            # перечитать и проверить, что блок на месте (ловит jsonb/column баги)
+            store2 = open_store(args)
+            try:
+                bad = 0
+                for ib in store2.list_inbounds():
+                    if args.inbound_id is not None and int(ib["id"]) != args.inbound_id:
+                        continue
+                    raw = ib.get("stream_settings")
+                    try:
+                        st = parse_stream(raw)
+                    except Exception:
+                        continue
+                    if st.get("network") != "xhttp" and "xhttpSettings" not in st:
+                        continue
+                    if not download_settings_ok(raw, download):
+                        print(
+                            f"VERIFY FAIL inbound id={ib['id']}: downloadSettings нет или не {download}",
+                            file=sys.stderr,
+                        )
+                        bad += 1
+                    else:
+                        print(f"verify ok inbound id={ib['id']}")
+                if bad:
+                    print(
+                        "error: downloadSettings не сохранился в БД — проверь колонку stream_settings",
+                        file=sys.stderr,
+                    )
+                    return 2
+            finally:
+                store2.close()
+            print("ok: записано в БД, разделение uplink/download на месте")
         return 0
     finally:
         store.close()
