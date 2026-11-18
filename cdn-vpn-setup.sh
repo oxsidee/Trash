@@ -855,7 +855,7 @@ if [[ -s "$ALLOW" ]]; then
   ips=$(tr -d '\r' < "$ALLOW" | awk 'NF' | paste -sd, -)
   if [[ -n "$ips" ]]; then
     PANEL_SET="set panel { type ipv4_addr; elements = { $ips } }"
-    PANEL_RULE="tcp dport { 2053, 2096 } ip saddr @panel accept"
+    PANEL_RULE="tcp dport { 443, 2053, 2096 } ip saddr @panel accept"
   fi
 fi
 tmp=$(mktemp)
@@ -868,7 +868,15 @@ else
 fi
 [ -s "$CACHE" ] || { echo "cdn-lock: нет списка подсетей Yandex CDN" >&2; exit 1; }
 geo_new=$(mktemp)
-{ echo 'geo $from_yc_cdn {'; echo '    default 0;'; sed 's/.*/    & 1;/' "$CACHE"; echo '}'; } > "$geo_new"
+{
+  echo 'geo $from_yc_cdn {'
+  echo '    default 0;'
+  sed 's/.*/    & 1;/' "$CACHE"
+  if [[ -s "$ALLOW" ]]; then
+    tr -d '\r' < "$ALLOW" | awk 'NF { print "    " $1 " 1;" }'
+  fi
+  echo '}'
+} > "$geo_new"
 if cmp -s "$geo_new" "$GEO"; then rm -f "$geo_new"
 else mv "$geo_new" "$GEO"; chmod 644 "$GEO"; nginx -t -q && systemctl reload nginx
 fi
