@@ -8,6 +8,7 @@
 #         bash cdn-vpn-setup.sh panel-proxy — открыть панель (2053) и подписки (2096) только для внешнего reverse proxy (NPM)
 #         bash cdn-vpn-setup.sh rotate      — авторотация CDN-доменов (hosts + downloadSettings), без ввода
 #         bash cdn-vpn-setup.sh rotate 10   — то же, uplink=cdn10 / download=cdn11
+#         bash cdn-vpn-setup.sh ensure-split — только восстановить downloadSettings (разделение потоков)
 # Со старого сервера удобнее: bash cdn-vpn-export.sh (рядом в репозитории).
 # Ответы и прогресс сохраняются в /root/.cdn-vpn.env — скрипт можно прервать и запустить снова.
 
@@ -707,10 +708,20 @@ step_panel_gui() {
     say "Подключение и клиенты взяты из бэкапа. В панели проверь только:"
     say "  «Входящие» → cdn-xhttp: порт ${c_b}$XRAY_PORT${c_0}, путь ${c_b}$XHTTP_PATH${c_0};  «Хосты»: адрес и SNI = ${c_b}$CDN_DOMAIN${c_0}."
   else
+    local dl_domain up_n=1
+    cdn_zone_from_domain "$CDN_DOMAIN"
+    if [[ "$CDN_DOMAIN" =~ ^${CDN_PREFIX}([0-9]+)\. ]]; then
+      up_n="${BASH_REMATCH[1]}"
+    elif [[ "$CDN_DOMAIN" == "${CDN_PREFIX}.${CDN_ZONE}" ]]; then
+      up_n=1
+    fi
+    dl_domain="${CDN_PREFIX}$((up_n + 1)).${CDN_ZONE}"
+
     say "Открой панель через SSH-туннель (команда выше), логин и пароль — в $PANEL_TXT"
     todo "1. «Дашборд» → обнови Xray до последней версии."
     todo "2. «Входящие» → «Создать подключение» → внизу «Дополнительные настройки» → раздел «Всё»."
     say  "   Удали всё в редакторе, вставь JSON ниже и сохрани:"
+    say  "   ${c_y}(downloadSettings — разделение uplink/download; после Save лучше дописать через bash $0 ensure-split)${c_0}"
     cat <<EOF
 ${c_b}
 {
@@ -731,7 +742,24 @@ ${c_b}
       "uplinkDataPlacement": "header",
       "uplinkDataKey": "x-edge-data",
       "scMaxEachPostBytes": "8192",
-      "serverMaxHeaderBytes": 65536
+      "serverMaxHeaderBytes": 65536,
+      "downloadSettings": {
+        "address": "$dl_domain",
+        "port": 443,
+        "network": "xhttp",
+        "security": "tls",
+        "tlsSettings": {
+          "serverName": "$dl_domain",
+          "fingerprint": "chrome",
+          "alpn": ["h2", "http/1.1"]
+        },
+        "xhttpSettings": {
+          "host": "$dl_domain",
+          "path": "$XHTTP_PATH",
+          "mode": "packet-up",
+          "xPaddingBytes": "100-1000"
+        }
+      }
     }
   }
 }
@@ -742,6 +770,7 @@ EOF
     say  "   Основное:     Входящие = cdn-xhttp,  Адрес = ${c_b}${CDN_DOMAIN}${c_0} (БЕЗ :443, нажми Enter чтобы появился тег),  Порт = 443"
     say  "   Безопасность: tls,  SNI = ${c_b}${CDN_DOMAIN}${c_0},  Fingerprint = chrome"
     say  "   Дополнительно: всё пустое → сохранить."
+    say  "   Download-домен в подписке: ${c_b}${dl_domain}${c_0} (нужен отдельный CDN/CNAME)."
   fi
   pause
   for _ in $(seq 1 10); do ss -tln | grep -q "127.0.0.1:$XRAY_PORT " && { ok "Xray слушает 127.0.0.1:$XRAY_PORT"; break; }; sleep 2; done
@@ -1037,7 +1066,7 @@ cdn_zone_from_domain() {
 }
 
 step_rotate() {
-  local start="${1:-}" rotate_py self_dir args=()
+  local start="${1:-}" mode="${2:-rotate}" rotate_py self_dir args=()
   self_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
   rotate_py="$self_dir/cdn-vpn-rotate.py"
   [[ -f "$rotate_py" ]] || { err "Нет $rotate_py рядом со скриптом"; return 1; }
@@ -1045,7 +1074,6 @@ step_rotate() {
 
   xui_load_env
   if [[ "$XUI_DB_TYPE" == postgres ]]; then
-    command -v python3 >/dev/null
     python3 -c 'import psycopg2' 2>/dev/null \
       || DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3-psycopg2 >/dev/null \
       || { err "Не установить python3-psycopg2"; return 1; }
@@ -1055,15 +1083,20 @@ step_rotate() {
 
   cdn_zone_from_domain "${CDN_DOMAIN:-}"
   export CDN_PREFIX CDN_ZONE
-  say "Ротация доменов ${c_b}${CDN_PREFIX}N.${CDN_ZONE}${c_0} (hosts remark/address/sni + downloadSettings)"
+  if [[ "$mode" == ensure-split ]]; then
+    say "Восстановление разделения потоков: ${c_b}xhttpSettings.downloadSettings${c_0}"
+    args+=(--ensure-split)
+  else
+    say "Ротация доменов ${c_b}${CDN_PREFIX}N.${CDN_ZONE}${c_0} (hosts + downloadSettings)"
+  fi
   [[ -n "$start" ]] && [[ "$start" =~ ^[0-9]+$ ]] && [[ "$start" -ge 1 ]] \
     && args+=(--start "$start") \
     || { [[ -z "$start" ]] || { err "Номер uplink — целое >= 1, получено: '$start'"; return 1; }; }
 
-  say "Страховочный бэкап перед ротацией..."
+  say "Страховочный бэкап..."
   step_backup >/tmp/cdn-rotate-backup.log 2>&1 \
     && ok "Бэкап снят (см. /tmp/cdn-rotate-backup.log)" \
-    || warn "Бэкап не удался — продолжаю ротацию (лог /tmp/cdn-rotate-backup.log)"
+    || warn "Бэкап не удался — продолжаю (лог /tmp/cdn-rotate-backup.log)"
 
   python3 "$rotate_py" "${args[@]}" || return 1
 
@@ -1071,11 +1104,14 @@ step_rotate() {
   sleep 2
   systemctl is-active --quiet x-ui && ok "x-ui перезапущен" || warn "x-ui не активен — journalctl -u x-ui -n 30"
 
-  say "\nДальше вручную в Yandex Cloud / DNS:"
-  say "  • выпусти/привяжи сертификат и CDN-ресурс на новый uplink/download;"
-  say "  • CNAME ${c_b}${CDN_PREFIX}N.${CDN_ZONE}${c_0} → технический домен CDN;"
-  say "  • клиенты подтянут новые домены после обновления подписки."
-  say "Повтор: ${c_b}bash $0 rotate${c_0}   или   ${c_b}bash $0 rotate 10${c_0}"
+  if [[ "$mode" != ensure-split ]]; then
+    say "\nДальше вручную в Yandex Cloud / DNS:"
+    say "  • выпусти/привяжи сертификат и CDN-ресурс на новый uplink/download;"
+    say "  • CNAME ${c_b}${CDN_PREFIX}N.${CDN_ZONE}${c_0} → технический домен CDN;"
+    say "  • клиенты подтянут новые домены после обновления подписки."
+  fi
+  say "Не открывай inbound в UI и не жми Save — панель может вырезать downloadSettings из JSON."
+  say "Команды: ${c_b}bash $0 rotate${c_0}  |  ${c_b}bash $0 ensure-split${c_0}"
 }
 
 step_finish() {
@@ -1110,7 +1146,13 @@ fi
 
 if [[ "${1:-}" == rotate ]]; then
   hdr R "Ротация CDN-доменов (авто)"
-  step_rotate "${2:-}"
+  step_rotate "${2:-}" rotate
+  exit
+fi
+
+if [[ "${1:-}" == ensure-split ]]; then
+  hdr R "Восстановление downloadSettings (разделение потоков)"
+  step_rotate "${2:-}" ensure-split
   exit
 fi
 
