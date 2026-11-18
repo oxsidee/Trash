@@ -683,7 +683,7 @@ def _env_file(path: str) -> dict[str, str]:
     return found
 
 
-def edge_config() -> tuple[str, str] | None:
+def edge_config() -> tuple[str, str, str] | None:
     file_vars: dict[str, str] = {}
     for path in (
         os.path.join(os.path.dirname(os.path.abspath(__file__)), "cdn-edge.env"),
@@ -692,9 +692,10 @@ def edge_config() -> tuple[str, str] | None:
         file_vars.update(_env_file(path))
     url = os.environ.get("CDN_EDGE_URL", file_vars.get("CDN_EDGE_URL", "")).strip()
     token = os.environ.get("CDN_EDGE_TOKEN", file_vars.get("CDN_EDGE_TOKEN", "")).strip()
+    write_url = os.environ.get("CDN_EDGE_WRITE_URL", file_vars.get("CDN_EDGE_WRITE_URL", "")).strip()
     if not url or not token:
         return None
-    return url, token
+    return url, token, write_url
 
 
 def known_edge_ips() -> list[str]:
@@ -891,11 +892,22 @@ def edge_get(url: str, token: str, vias: list[str]) -> tuple[bool, list[str], st
     return False, [], None
 
 
+def write_target(url: str) -> str:
+    parsed = urllib.parse.urlsplit(url.strip())
+    if parsed.scheme != "https" or not parsed.hostname:
+        raise ValueError("CDN_EDGE_WRITE_URL должен быть https://хост")
+    path = parsed.path or "/"
+    if path == "/":
+        path = "/_edge/v1"
+    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, path, parsed.query, ""))
+
+
 def edge_apply(
     url: str,
     token: str,
     hits: list[tuple[str, int]],
     via: str | None,
+    write_url: str,
 ) -> str:
     if not hits:
         print("живых IP нет, 3x-ui не меняю", flush=True)
@@ -903,7 +915,7 @@ def edge_apply(
     vias = [ip for ip, _ms in sorted(hits, key=lambda item: item[1])]
     if via and via not in vias:
         vias.insert(0, via)
-    ok, addresses, route = edge_get(url, token, vias)
+    ok, addresses, _route = edge_get(url, token, vias)
     if not ok:
         print("сервер не ответил, 3x-ui не меняю", flush=True)
         return "сервер не ответил, 3x-ui не менялся"
@@ -911,10 +923,19 @@ def edge_apply(
     if chosen is None:
         print("текущий IP уже среди живых, не меняю", flush=True)
         return "текущий IP уже среди живых"
+    if not write_url:
+        print("CDN_EDGE_WRITE_URL не задан, 3x-ui не меняю", flush=True)
+        return "CDN_EDGE_WRITE_URL не задан, 3x-ui не менялся"
     try:
-        result = edge_exchange(url, token, "POST", route or chosen, {"address": chosen})
-    except Exception as exc:
+        target = write_target(write_url)
+    except ValueError as exc:
         print(f"не записал {chosen}: {exc}", flush=True)
+        return f"не записал {chosen}"
+    print(f"пишу {chosen} на {target}", flush=True)
+    try:
+        result = edge_exchange(target, token, "POST", None, {"address": chosen})
+    except Exception as exc:
+        print(f"не записал {chosen} через {target}: {exc}", flush=True)
         return f"не записал {chosen}"
     ms = next(ms for ip, ms in hits if ip == chosen)
     line = f"3x-ui → {chosen} {ms}ms"
@@ -952,7 +973,7 @@ def remember(summary: str) -> None:
         handle.write("\n".join(kept) + "\n")
 
 
-def run_full_scan(cfg: tuple[str, str] | None, via: str | None) -> None:
+def run_full_scan(cfg: tuple[str, str, str] | None, via: str | None) -> None:
     before = set(known_edge_ips())
     nets = collect_networks()
     total = sum(host_count(net) for net in nets)
@@ -966,7 +987,7 @@ def run_full_scan(cfg: tuple[str, str] | None, via: str | None) -> None:
     if cfg is None:
         remember(f"полное сканирование, найдено {len(hits)}, новых {fresh}, 3x-ui не менялся")
         return
-    result = edge_apply(cfg[0], cfg[1], hits, via)
+    result = edge_apply(cfg[0], cfg[1], hits, via, cfg[2])
     remember(f"полное сканирование, найдено {len(hits)}, новых {fresh}, {result}")
 
 
