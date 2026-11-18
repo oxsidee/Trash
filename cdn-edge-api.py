@@ -12,6 +12,7 @@ import ipaddress
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -217,19 +218,22 @@ def apply_address(ip: str) -> dict:
 def restart_xui() -> bool:
     if os.environ.get("CDN_EDGE_NO_RESTART") == "1":
         return True
+    raw = os.environ.get("CDN_EDGE_RESTART", "systemctl restart x-ui").strip()
+    if not raw:
+        return True
     try:
         proc = subprocess.run(
-            ["systemctl", "restart", "x-ui"],
+            shlex.split(raw),
             check=False,
-            timeout=40,
+            timeout=60,
             capture_output=True,
             text=True,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        print(f"restart x-ui: {exc}", file=sys.stderr)
+    except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
+        print(f"restart: {exc}", file=sys.stderr)
         return False
     if proc.returncode != 0:
-        print(proc.stderr.strip() or f"systemctl {proc.returncode}", file=sys.stderr)
+        print(proc.stderr.strip() or proc.stdout.strip() or f"restart {proc.returncode}", file=sys.stderr)
         return False
     return True
 
