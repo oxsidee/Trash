@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# OmniRoute получает свой MAC и свой адрес в сети текущего шлюза.
-# В Keenetic в политику xkeen переносится только это устройство.
+# OmniRoute получает свой MAC в LAN, чтобы Keenetic отправил в xkeen только его.
+# Родитель — ethernet. Wi-Fi пропускает один MAC, поэтому при Wi-Fi нужен кабель
+# в LAN Keenetic. Сам сервер остаётся на своём текущем подключении.
 # Запуск на сервере с контейнером, от root:
 #   bash omniroute-egress.sh /путь/docker-compose.yaml
 #   bash omniroute-egress.sh down
@@ -11,6 +12,8 @@ NET_NAME=omniroute_egress
 SBIN=/usr/local/sbin/omniroute-egress.sh
 UNIT_IP=/etc/systemd/system/omniroute-egress-ip.service
 UNIT_SNAT=/etc/systemd/system/omniroute-egress.service
+UNIT_LINK=/etc/systemd/system/omniroute-egress-link.service
+SYS_NET=${SYS_NET:-/sys/class/net}
 
 PREFER_IP=${EGRESS_IP-}
 [[ -f "$ENV_FILE" ]] && source "$ENV_FILE"
@@ -20,6 +23,7 @@ PREFER_IP=${EGRESS_IP-}
 : "${PROJECT:=}"
 : "${LAST_BAK:=}"
 : "${NET_NAME:=omniroute_egress}"
+: "${PARENT:=}"
 
 c_g=$'\e[32m'; c_y=$'\e[33m'; c_r=$'\e[31m'; c_0=$'\e[0m'
 say()  { echo -e "$*"; }
@@ -110,7 +114,7 @@ PY
   while read -r ip; do
     [[ -n "$ip" ]] || continue
     if command -v arping >/dev/null 2>&1; then
-      out=$(arping -D -I "$IFACE" -c 2 "$ip" 2>&1 || true)
+      out=$(arping -D -I "${PARENT:-$IFACE}" -c 2 "$ip" 2>&1 || true)
       if [[ "$out" == *[Rr]eply* ]]; then
         warn "$ip занят"
         continue
@@ -140,13 +144,247 @@ cleanup_alias() {
 
 write_env() {
   umask 022
-  printf 'EGRESS_IP=%q\nCOMPOSE_FILE=%q\nPROJECT=%q\nLAST_BAK=%q\nNET_NAME=%q\n' \
-    "$EGRESS_IP" "$COMPOSE_FILE" "$PROJECT" "$LAST_BAK" "$NET_NAME" > "$ENV_FILE"
+  printf 'EGRESS_IP=%q\nCOMPOSE_FILE=%q\nPROJECT=%q\nLAST_BAK=%q\nNET_NAME=%q\nPARENT=%q\n' \
+    "$EGRESS_IP" "$COMPOSE_FILE" "$PROJECT" "$LAST_BAK" "$NET_NAME" "${PARENT:-}" > "$ENV_FILE"
   chmod 644 "$ENV_FILE"
 }
 
+is_wifi() {
+  [[ -d "$SYS_NET/$1/phy80211" || -d "$SYS_NET/$1/wireless" ]]
+}
+
+is_physical_eth() {
+  local i=$1 t
+  [[ "$i" == lo || "$i" == docker* || "$i" == veth* || "$i" == br-* || "$i" == virbr* ]] && return 1
+  is_wifi "$i" && return 1
+  [[ -d "$SYS_NET/$i/bridge" ]] && return 1
+  [[ -e "$SYS_NET/$i/device" ]] || return 1
+  t=$(cat "$SYS_NET/$i/type" 2>/dev/null || echo 0)
+  [[ "$t" == 1 ]]
+}
+
+choose_parent() {
+  local i carrier base addr
+  PARENT=""
+  ETH_PRESENT=""
+  if ! is_wifi "$IFACE"; then
+    PARENT=$IFACE
+    return 0
+  fi
+  for base in "$SYS_NET"/*; do
+    [[ -e "$base" ]] || continue
+    i=$(basename "$base")
+    is_physical_eth "$i" || continue
+    ETH_PRESENT+="$i "
+    carrier=$(cat "$SYS_NET/$i/carrier" 2>/dev/null || echo 0)
+    if [[ "$carrier" != 1 ]]; then
+      ip link set "$i" up >/dev/null 2>&1 || true
+      sleep 1
+      carrier=$(cat "$SYS_NET/$i/carrier" 2>/dev/null || echo 0)
+    fi
+    [[ "$carrier" == 1 ]] || continue
+    if [[ -z "$PARENT" ]]; then
+      PARENT=$i
+    fi
+    addr=$(ip -4 -o addr show dev "$i" 2>/dev/null | awk '{print $4; exit}' || true)
+    if [[ -n "$addr" && -n "${SUBNET:-}" ]] && python3 -c 'import ipaddress,sys; raise SystemExit(0 if ipaddress.ip_address(sys.argv[1].split("/")[0]) in ipaddress.ip_network(sys.argv[2], strict=False) else 1)' "$addr" "$SUBNET"; then
+      PARENT=$i
+      break
+    fi
+  done
+  ETH_PRESENT=${ETH_PRESENT% }
+  [[ -n "$PARENT" ]]
+}
+
+plain_bak() {
+  local f
+  if [[ -n "${LAST_BAK:-}" && -f "$LAST_BAK" ]] && ! grep -Eq 'omniroute_egress|host_ipv4|macvlan' "$LAST_BAK"; then
+    printf '%s\n' "$LAST_BAK"
+    return 0
+  fi
+  for f in "$COMPOSE_FILE".bak.*; do
+    [[ -f "$f" ]] || continue
+    grep -Eq 'omniroute_egress|host_ipv4|macvlan' "$f" && continue
+    printf '%s\n' "$f"
+    return 0
+  done
+  return 1
+}
+
+unpatch_compose() {
+  python3 - "$COMPOSE_FILE" <<'PY'
+import sys
+path = sys.argv[1]
+lines = [l.rstrip("\r") for l in open(path).read().splitlines()]
+
+def find_service(lines):
+    for i, line in enumerate(lines):
+        raw = line.split("#", 1)[0].rstrip()
+        if raw.startswith(" ") and raw.strip().startswith("omniroute:") and raw.strip().split(":", 1)[0].strip() == "omniroute":
+            return i
+    for i, line in enumerate(lines):
+        if line.split("#", 1)[0].strip() not in (
+            "container_name: omniroute",
+            'container_name: "omniroute"',
+            "container_name: 'omniroute'",
+        ):
+            continue
+        ind = len(line) - len(line.lstrip(" "))
+        for j in range(i, -1, -1):
+            raw = lines[j].split("#", 1)[0]
+            if not raw.strip():
+                continue
+            jind = len(raw) - len(raw.lstrip(" "))
+            if 0 < jind < ind and raw.strip().endswith(":"):
+                return j
+    return None
+
+def span(lines, idx):
+    base = len(lines[idx]) - len(lines[idx].lstrip(" "))
+    for j in range(idx + 1, len(lines)):
+        raw = lines[j].split("#", 1)[0]
+        if raw.strip() and len(raw) - len(raw.lstrip(" ")) <= base:
+            return j
+    return len(lines)
+
+def key_indent_of(lines, idx, end):
+    base = len(lines[idx]) - len(lines[idx].lstrip(" "))
+    for line in lines[idx + 1:end]:
+        raw = line.split("#", 1)[0]
+        if raw.strip():
+            ind = len(raw) - len(raw.lstrip(" "))
+            if ind > base:
+                return ind
+    return base + 2
+
+def drop_keys(chunk, indent, names):
+    out, i = [], 0
+    while i < len(chunk):
+        raw = chunk[i].split("#", 1)[0]
+        if raw.strip():
+            ind = len(raw) - len(raw.lstrip(" "))
+            key = raw.strip().split(":", 1)[0].strip()
+            if ind == indent and key in names:
+                i += 1
+                while i < len(chunk):
+                    r = chunk[i].split("#", 1)[0]
+                    if r.strip() and len(r) - len(r.lstrip(" ")) <= indent:
+                        break
+                    i += 1
+                continue
+        out.append(chunk[i])
+        i += 1
+    return out
+
+svc = find_service(lines)
+if svc is None:
+    sys.exit("в compose нет сервиса omniroute")
+end = span(lines, svc)
+indent = key_indent_of(lines, svc, end)
+body = drop_keys(lines[svc + 1:end], indent, {"networks", "mac_address"})
+if not any(l.split("#", 1)[0].strip().startswith("ports:") and (len(l) - len(l.lstrip(" "))) == indent for l in body):
+    pad, pad2 = " " * indent, " " * (indent + 2)
+    body = [pad + "ports:", pad2 + '- "20128:20128"'] + body
+lines = lines[:svc + 1] + body + lines[end:]
+
+root = None
+for i, line in enumerate(lines):
+    if line.split("#", 1)[0].strip() == "networks:" and not line.startswith(" "):
+        root = i
+        break
+if root is not None:
+    kept = []
+    i = root + 1
+    while i < len(lines):
+        raw = lines[i].split("#", 1)[0]
+        if raw.strip():
+            ind = len(raw) - len(raw.lstrip(" "))
+            if ind == 0:
+                break
+            if ind <= 2 and raw.strip().split(":", 1)[0].strip() == "egress":
+                i += 1
+                while i < len(lines):
+                    r = lines[i].split("#", 1)[0]
+                    if r.strip() and len(r) - len(r.lstrip(" ")) <= 2:
+                        break
+                    i += 1
+                continue
+        kept.append(lines[i])
+        i += 1
+    if any(l.strip() for l in kept):
+        lines = lines[:root + 1] + kept + lines[i:]
+    else:
+        lines = lines[:root] + lines[i:]
+        while lines and not lines[-1].strip():
+            lines.pop()
+open(path, "w").write("\n".join(lines) + "\n")
+PY
+}
+
+restore_running() {
+  local src vol newvol
+  [[ -n "${PROJECT:-}" ]] || PROJECT=$(container_project || true)
+  vol=$(container_vol || true)
+  src=$(plain_bak || true)
+  if [[ -n "$src" ]]; then
+    cp -a "$src" "$COMPOSE_FILE"
+    ok "compose возвращён из $src"
+  else
+    unpatch_compose
+    ok "macvlan убран, порт 20128 снова на сервере"
+  fi
+  docker rm -f omniroute >/dev/null 2>&1 || true
+  docker network rm "$NET_NAME" >/dev/null 2>&1 || true
+  dc up -d --force-recreate --no-deps omniroute
+  newvol=$(container_vol || true)
+  if [[ -n "$vol" && -n "$newvol" && "$newvol" != "$vol" ]]; then
+    err "том сменился ($vol → $newvol)"
+    return 1
+  fi
+  [[ -n "$vol" ]] && ok "том данных тот же: $vol"
+}
+
+link_unit() {
+  local ipb
+  ipb=$(command -v ip)
+  cat > "$UNIT_LINK" <<EOF
+[Unit]
+Description=Bring up $PARENT for OmniRoute
+DefaultDependencies=no
+Before=docker.service
+After=network-pre.target
+
+[Service]
+Type=oneshot
+ExecStart=$ipb link set $PARENT up
+RemainAfterExit=yes
+
+[Install]
+WantedBy=docker.service
+EOF
+  systemctl daemon-reload
+  systemctl enable --now omniroute-egress-link.service >/dev/null
+}
+
+drop_link_unit() {
+  systemctl disable --now omniroute-egress-link.service >/dev/null 2>&1 || true
+  rm -f "$UNIT_LINK"
+  systemctl daemon-reload >/dev/null 2>&1 || true
+}
+
+explain_wifi() {
+  say "Wi-Fi ($IFACE) пропускает только один MAC. Keenetic видит весь сервер как одно устройство, поэтому отдельный адрес OmniRoute в xkeen не попадает."
+  say "OmniRoute снова на обычной сети. Панель — порт 20128 этого сервера."
+  if [[ -n "${ETH_PRESENT:-}" ]]; then
+    say "Воткни кабель из порта ${ETH_PRESENT} в LAN Keenetic, Wi-Fi не отключай, и запусти скрипт ещё раз."
+  else
+    say "Отдельного ethernet-порта нет. Нужен USB-Ethernet в LAN Keenetic, затем запусти скрипт ещё раз."
+  fi
+  say "После этого в xkeen перетаскивается только OmniRoute, сервер остаётся как есть."
+}
+
 patch_compose() {
-  python3 - "$COMPOSE_FILE" "$EGRESS_IP" "$NET_NAME" "$IFACE" "$SUBNET" "$GATEWAY" "$OMNI_MAC" <<'PY'
+  python3 - "$COMPOSE_FILE" "$EGRESS_IP" "$NET_NAME" "$PARENT" "$SUBNET" "$GATEWAY" "$OMNI_MAC" <<'PY'
 import sys
 path, ip, net, parent, subnet, gateway, mac = sys.argv[1:]
 lines = [l.rstrip("\r") for l in open(path).read().splitlines()]
@@ -365,9 +603,10 @@ verify_egress() {
   ok "OmniRoute в LAN: $cip  MAC ${mac:-$OMNI_MAC}"
   if timeout 5 nsenter -t "$pid" -n ping -c 1 -W 2 "$GATEWAY" >/dev/null 2>&1; then
     ok "шлюз $GATEWAY отвечает контейнеру"
-  else
-    warn "контейнер не достучался до $GATEWAY. Если это виртуалка, гипервизор должен пропускать чужие MAC"
+    return 0
   fi
+  err "контейнер не достучался до $GATEWAY"
+  return 1
 }
 
 cmd_install() {
@@ -379,16 +618,32 @@ cmd_install() {
   COMPOSE_DIR=$(dirname "$COMPOSE_FILE")
 
   stop_snat
-  pick_ip
-  valid_ip "$EGRESS_IP" || { err "некорректный IP $EGRESS_IP"; exit 1; }
-  cleanup_alias
-  ok "шлюз $GATEWAY на $IFACE, OmniRoute: $EGRESS_IP  MAC $OMNI_MAC"
-  [[ "$IFACE" == wl* || "$IFACE" == wlan* ]] && warn "macvlan на Wi-Fi обычно не работает, нужен ethernet"
+  local tmp
+  tmp=$(mktemp)
+  cp "$BASH_SOURCE" "$tmp"
+  install -m 0755 "$tmp" "$SBIN"
+  rm -f "$tmp"
 
+  lan_params || exit 1
+  cleanup_alias
   local vol proj
   proj=$(container_project || true)
   [[ -n "$proj" ]] && PROJECT=$proj
   vol=$(container_vol || true)
+
+  if ! choose_parent; then
+    restore_running || true
+    explain_wifi
+    exit 1
+  fi
+  pick_ip
+  valid_ip "$EGRESS_IP" || { err "некорректный IP $EGRESS_IP"; exit 1; }
+  ip link set "$PARENT" up
+  if [[ "$PARENT" == "$IFACE" ]]; then
+    ok "шлюз $GATEWAY на $PARENT, OmniRoute: $EGRESS_IP  MAC $OMNI_MAC"
+  else
+    ok "сервер остаётся на $IFACE. Кабель $PARENT: OmniRoute $EGRESS_IP  MAC $OMNI_MAC"
+  fi
 
   local newbak prev_bak
   prev_bak=${LAST_BAK:-}
@@ -412,10 +667,8 @@ cmd_install() {
   docker rm -f omniroute >/dev/null 2>&1 || true
   docker network rm "$NET_NAME" >/dev/null 2>&1 || true
   if ! dc up -d --force-recreate --no-deps omniroute; then
-    warn "не поднялся — возвращаю прежний compose"
-    cp -a "$newbak" "$COMPOSE_FILE"
-    docker network rm "$NET_NAME" >/dev/null 2>&1 || true
-    dc up -d --force-recreate --no-deps omniroute || true
+    warn "не поднялся — возвращаю обычную сеть"
+    restore_running || true
     exit 1
   fi
 
@@ -431,17 +684,28 @@ cmd_install() {
   fi
   [[ -n "$vol" ]] && ok "том данных тот же: $vol"
 
-  local tmp
-  tmp=$(mktemp)
-  cp "$BASH_SOURCE" "$tmp"
-  install -m 0755 "$tmp" "$SBIN"
-  rm -f "$tmp"
   write_env
-  verify_egress || true
+  if [[ "$PARENT" != "$IFACE" ]]; then
+    link_unit || true
+  fi
+  if ! verify_egress; then
+    warn "шлюз $GATEWAY не ответил через $PARENT. Кабель должен быть в LAN этого Keenetic."
+    drop_link_unit
+    restore_running || true
+    say "OmniRoute снова на обычной сети. Панель — порт 20128 этого сервера."
+    exit 1
+  fi
 
+  local pmac=""
+  pmac=$(cat "$SYS_NET/$PARENT/address" 2>/dev/null || true)
   say "Панель: http://${EGRESS_IP}:20128 — с другого устройства в LAN, не с самого сервера."
   say "Keenetic → Приоритеты подключений → Показать все объекты."
-  say "В xkeen перетащи только $EGRESS_IP ($OMNI_MAC). Сервер не трогай."
+  say "В xkeen перетащи только $EGRESS_IP ($OMNI_MAC)."
+  if [[ "$PARENT" != "$IFACE" ]]; then
+    say "Сервер не трогай, его интернет по-прежнему $IFACE. Не перетаскивай и порт $PARENT${pmac:+ ($pmac)}."
+  else
+    say "Сервер не трогай."
+  fi
   say "На вкладке «Политики доступа в интернет» у xkeen нужное подключение должно быть первым."
   say "Снять: bash $SBIN down"
 }
@@ -451,27 +715,17 @@ cmd_down() {
   [[ -f "$ENV_FILE" ]] && source "$ENV_FILE"
   systemctl disable --now omniroute-egress.service omniroute-egress-ip.service >/dev/null 2>&1 || true
   rm -f "$UNIT_IP" "$UNIT_SNAT"
-  systemctl daemon-reload || true
+  drop_link_unit
   local ipt
   ipt=$(ipt_bin || true)
   del_our_rules "${ipt:-}"
-  if [[ -n "${COMPOSE_FILE:-}" && -f "${LAST_BAK:-}" && -f "$COMPOSE_FILE" ]]; then
+  if [[ -n "${COMPOSE_FILE:-}" && -f "$COMPOSE_FILE" ]]; then
     COMPOSE_DIR=$(dirname "$COMPOSE_FILE")
-    cp -a "$LAST_BAK" "$COMPOSE_FILE"
-    docker rm -f omniroute >/dev/null 2>&1 || true
-    docker network rm "$NET_NAME" >/dev/null 2>&1 || true
-    if ! dc up -d --force-recreate --no-deps omniroute; then
-      err "не удалось вернуть контейнер. Адрес $EGRESS_IP оставлен на интерфейсе."
-      return 1
-    fi
-    ok "compose возвращён из $LAST_BAK"
-  elif [[ -n "${COMPOSE_FILE:-}" && -f "$COMPOSE_FILE" ]] && grep -q omniroute_egress "$COMPOSE_FILE"; then
-    err "нет бэкапа compose, адрес $EGRESS_IP не снимаю — иначе контейнер потеряет маршрут"
-    return 1
+    restore_running
   fi
   IFACE=""
   find_iface || true
-  if [[ -n "${IFACE:-}" ]]; then
+  if [[ -n "${IFACE:-}" ]] && valid_ip "${EGRESS_IP:-}"; then
     ip addr del "${EGRESS_IP}/32" dev "$IFACE" 2>/dev/null || true
     if command -v nmcli >/dev/null 2>&1; then
       local con
