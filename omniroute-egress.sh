@@ -566,7 +566,7 @@ Description=Refresh OmniRoute 3x-ui subscription
 
 [Timer]
 OnBootSec=2min
-OnUnitActiveSec=6h
+OnUnitActiveSec=1h
 Persistent=true
 
 [Install]
@@ -578,8 +578,18 @@ EOF
 
 cmd_refresh() {
   [[ -n "${XRAY_SUB:-}" ]] || { err "нет сохранённой ссылки"; exit 1; }
-  local info
-  info=$(fetch_provider) || return 1
+  local info old=""
+  if [[ -f "$VPN_DIR/provider.yaml" ]]; then
+    old=$(mktemp)
+    cp -a "$VPN_DIR/provider.yaml" "$old"
+  fi
+  info=$(fetch_provider) || { [[ -n "$old" ]] && rm -f "$old"; return 1; }
+  if [[ -n "$old" ]] && cmp -s "$old" "$VPN_DIR/provider.yaml"; then
+    rm -f "$old"
+    ok "подписка без изменений"
+    return 0
+  fi
+  [[ -n "$old" ]] && rm -f "$old"
   if docker ps -a --format '{{.Names}}' | grep -qx omniroute-xray; then
     docker restart omniroute-xray >/dev/null
   fi
